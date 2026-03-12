@@ -6,3 +6,4 @@ luts/*.cube
 .DS_Store
 .claude
 CLAUDE.md
+config.json
