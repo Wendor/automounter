@@ -1,0 +1,8 @@
+node_modules
+package-lock.json
+music/*.mp3
+result/*.mp4
+luts/*.cube
+.DS_Store
+.claude
+CLAUDE.md

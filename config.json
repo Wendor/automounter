@@ -1,0 +1,10 @@
+{
+  "input": "/Volumes/Untitled/DCIM/DJI_001",
+  "audio": "music/paulyudin-inspiration-490407.mp3",
+  "prompt": "Сделай эпичный ролик с природой, используй видео с 23 по 27 августа 2025",
+  "duration": 120,
+  "bitrate": 0,
+  "lut": "luts/DJI Mini 4 Pro D-Log M to Rec.709 V1_.cube",
+  "output": "final_edit.mp4",
+  "model": "llava:13b"
+}
