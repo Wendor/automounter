@@ -118,18 +118,32 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
 
     const cb: PipelineCB = {
       stage(n, total, label) {
+        const MAIN_STAGE_NAMES = [
+          "Анализ аудио",
+          "Сканирование",
+          "AI фильтрация",
+          "Индексация",
+          "Монтаж",
+          "Рендеринг",
+          "Сборка",
+        ];
         currentStageRef.current = n;
         totalStagesRef.current = total;
         setStages((prev) => {
           let next =
             prev.length === 0
-              ? Array.from({ length: total }, (_, i) => ({
-                  label: i === n - 1 ? label : `Стадия ${i + 1}`,
-                  status: "pending" as StageStatus,
-                  detail: "",
-                  progress: -1,
-                  counter: "",
-                }))
+              ? Array.from({ length: total }, (_, i) => {
+                  let stageLabel =
+                    total === 7 ? (MAIN_STAGE_NAMES[i] ?? "...") : `...`;
+                  if (i === n - 1) stageLabel = label;
+                  return {
+                    label: stageLabel,
+                    status: "pending" as StageStatus,
+                    detail: "",
+                    progress: -1,
+                    counter: "",
+                  };
+                })
               : [...prev];
           return next.map((s, i) => {
             if (i < n - 1) return { ...s, status: "done" as StageStatus };
@@ -228,22 +242,22 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
       <box style={{ flexDirection: "column", flexGrow: 1, marginRight: 1 }}>
         <box
           style={{
-            height: 11,
+            height: 9,
             borderStyle: "rounded",
             borderColor: THEME.border,
-            padding: 1,
-            marginBottom: 1,
+            paddingLeft: 1,
+            paddingRight: 1,
             flexDirection: "column",
           }}
         >
-          <text style={{ fg: THEME.accent, attributes: 1 }}>
+          <text style={{ fg: THEME.text, attributes: 1 }}>
             {" "}
             PROJECT CONFIG{" "}
           </text>
           <box style={{ flexDirection: "column", marginTop: 1 }}>
             <box style={{ flexDirection: "row" }}>
               <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Input: </text>
+                <text style={{ fg: THEME.text }}>Input: </text>
               </box>
               <text style={{ fg: THEME.highlight }}>
                 {truncate(config.input, maxValLen)}
@@ -251,7 +265,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
             </box>
             <box style={{ flexDirection: "row" }}>
               <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Audio: </text>
+                <text style={{ fg: THEME.text }}>Audio: </text>
               </box>
               <text style={{ fg: THEME.highlight }}>
                 {truncate(config.audio, maxValLen)}
@@ -259,23 +273,27 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
             </box>
             <box style={{ flexDirection: "row" }}>
               <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Prompt: </text>
+                <text style={{ fg: THEME.text }}>Quality: </text>
+              </box>
+              <text style={{ fg: THEME.highlight }}>
+                {truncate(config.quality, maxValLen)}
+              </text>
+            </box>
+            <box style={{ flexDirection: "row" }}>
+              <box style={{ width: 12 }}>
+                <text style={{ fg: THEME.text }}>Duration: </text>
+              </box>
+              <text style={{ fg: THEME.highlight }}>
+                {config.duration}
+              </text>
+            </box>
+            <box style={{ flexDirection: "row" }}>
+              <box style={{ width: 12 }}>
+                <text style={{ fg: THEME.text }}>Prompt: </text>
               </box>
               <text style={{ fg: THEME.highlight }}>
                 {truncate(config.prompt, maxValLen)}
               </text>
-            </box>
-            <box style={{ flexDirection: "row", marginTop: 1 }}>
-              <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Duration: </text>
-              </box>
-              <box style={{ width: 10 }}>
-                <text style={{ fg: THEME.highlight }}>{config.duration}s</text>
-              </box>
-              <box style={{ width: 12, marginLeft: 2 }}>
-                <text style={{ fg: THEME.dim }}>Quality: </text>
-              </box>
-              <text style={{ fg: THEME.highlight }}>{config.quality}</text>
             </box>
           </box>
         </box>
@@ -284,8 +302,8 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
             flexGrow: 1,
             borderStyle: "rounded",
             borderColor: errorMsg ? THEME.error : THEME.accent,
-            padding: 1,
-            marginBottom: 1,
+            paddingLeft: 1,
+            paddingRight: 1,
             flexDirection: "column",
           }}
         >
@@ -320,7 +338,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
                           ? THEME.success
                           : log.msg.startsWith("✗")
                             ? THEME.error
-                            : THEME.dim,
+                            : THEME.text,
                       flexGrow: 1,
                     }}
                   >
@@ -328,7 +346,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
                   </text>
                   {log.duration ? (
                     <box style={{ marginRight: 1 }}>
-                      <text style={{ fg: THEME.border }}>
+                      <text style={{ fg: THEME.text }}>
                         {formatDuration(log.duration)}
                       </text>
                     </box>
@@ -343,7 +361,8 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
             height: 5,
             borderStyle: "rounded",
             borderColor: THEME.border,
-            padding: 1,
+            paddingLeft: 1,
+            paddingRight: 1,
             flexDirection: "column",
           }}
         >
@@ -352,20 +371,21 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
             OVERALL PROGRESS{" "}
           </text>
           <box style={{ marginTop: 1, flexGrow: 1 }}>
-            <ProgressBar value={overallPct} width={leftColWidth - 4} />
+            <ProgressBar value={overallPct} width={leftColWidth - 14} />
           </box>
         </box>
       </box>
       <box
         style={{
-          width: 35,
+          width: 45,
           borderStyle: "rounded",
           borderColor: THEME.border,
-          padding: 1,
+          paddingLeft: 1,
+          paddingRight: 1,
           flexDirection: "column",
         }}
       >
-        <text style={{ fg: THEME.dim, attributes: 1 }}> PIPELINE </text>
+        <text style={{ fg: THEME.text, attributes: 1 }}> PIPELINE </text>
         <box style={{ flexDirection: "column", marginTop: 1, flexGrow: 1 }}>
           {stages.map((s, i) => (
             <box key={i} style={{ marginBottom: 1, flexDirection: "column" }}>
@@ -402,7 +422,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
                 ) : null}
               </box>
               {s.detail ? (
-                <text style={{ fg: THEME.border, marginLeft: 2 }}>
+                <text style={{ fg: THEME.dim, marginLeft: 2 }}>
                   {truncate(s.detail, 30)}
                 </text>
               ) : null}
@@ -410,7 +430,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
                 <box style={{ marginLeft: 2, marginTop: 0 }}>
                   <ProgressBar
                     value={s.progress}
-                    width={28}
+                    width={31}
                     fg={THEME.highlight}
                   />
                 </box>
