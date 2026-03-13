@@ -4,7 +4,7 @@ import { Config } from "../config";
 import { THEME } from "./index";
 
 export interface PipelineCB {
-  stage(n: number, total: number, label: string): void;
+  stage(n: number, stages: string[], current: number): void;
   info(msg: string): void;
   log(msg: string): void;
   renderTick(segIdx: number, segPct: number, done: number, total: number): void;
@@ -117,7 +117,9 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
     };
 
     const cb: PipelineCB = {
-      stage(n, total, label) {
+      stage(n, stages, current) {
+        const total = stages.length;
+        const label = stages[current];
         const MAIN_STAGE_NAMES = [
           "Анализ аудио",
           "Сканирование",
@@ -366,7 +368,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
             flexDirection: "column",
           }}
         >
-          <text style={{ fg: THEME.dim, attributes: 1 }}>
+          <text style={{ fg: THEME.text, attributes: 1 }}>
             {" "}
             OVERALL PROGRESS{" "}
           </text>

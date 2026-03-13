@@ -421,22 +421,22 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
       <box style={{ flexDirection: "column", flexGrow: 1, marginRight: 1 }}>
         <box
           style={{
-            height: 11,
+            height: 9,
             borderStyle: "rounded",
             borderColor: THEME.border,
-            padding: 1,
-            marginBottom: 1,
+            paddingLeft: 1,
+            paddingRight: 1,
             flexDirection: "column",
           }}
         >
-          <text style={{ fg: THEME.accent, attributes: 1 }}>
+          <text style={{ fg: THEME.text, attributes: 1 }}>
             {" "}
             PROJECT CONFIG{" "}
           </text>
           <box style={{ flexDirection: "column", marginTop: 1 }}>
             <box style={{ flexDirection: "row" }}>
               <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Video: </text>
+                <text style={{ fg: THEME.text }}>Video: </text>
               </box>
               <text style={{ fg: THEME.highlight }}>
                 {truncate(form.input || "—", maxValLen)}
@@ -444,7 +444,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             </box>
             <box style={{ flexDirection: "row" }}>
               <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Audio: </text>
+                <text style={{ fg: THEME.text }}>Audio: </text>
               </box>
               <text style={{ fg: THEME.highlight }}>
                 {truncate(path.basename(form.audio) || "—", maxValLen)}
@@ -452,23 +452,27 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             </box>
             <box style={{ flexDirection: "row" }}>
               <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Prompt: </text>
+                <text style={{ fg: THEME.text }}>Duration: </text>
+              </box>
+              <text style={{ fg: THEME.highlight }}>
+                {truncate(form.duration || "—", maxValLen)}s
+              </text>
+            </box>
+            <box style={{ flexDirection: "row" }}>
+              <box style={{ width: 12 }}>
+                <text style={{ fg: THEME.text }}>Quality: </text>
+              </box>
+              <text style={{ fg: THEME.highlight }}>
+                {truncate(form.quality || "—", maxValLen)}
+              </text>
+            </box>
+            <box style={{ flexDirection: "row" }}>
+              <box style={{ width: 12 }}>
+                <text style={{ fg: THEME.text }}>Prompt: </text>
               </box>
               <text style={{ fg: THEME.highlight }}>
                 {truncate(form.prompt || "—", maxValLen)}
               </text>
-            </box>
-            <box style={{ flexDirection: "row", marginTop: 1 }}>
-              <box style={{ width: 12 }}>
-                <text style={{ fg: THEME.dim }}>Duration: </text>
-              </box>
-              <box style={{ width: 10 }}>
-                <text style={{ fg: THEME.highlight }}>{form.duration}s</text>
-              </box>
-              <box style={{ width: 12, marginLeft: 2 }}>
-                <text style={{ fg: THEME.dim }}>Quality: </text>
-              </box>
-              <text style={{ fg: THEME.highlight }}>{form.quality}</text>
             </box>
           </box>
         </box>
@@ -477,8 +481,8 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             flexGrow: 1,
             borderStyle: "rounded",
             borderColor: THEME.accent,
-            padding: 1,
-            marginBottom: 1,
+            paddingLeft: 1,
+            paddingRight: 1,
             flexDirection: "column",
           }}
         >
@@ -495,16 +499,17 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             height: 5,
             borderStyle: "rounded",
             borderColor: THEME.border,
-            padding: 1,
+            paddingLeft: 1,
+            paddingRight: 1,
             flexDirection: "column",
           }}
         >
-          <text style={{ fg: THEME.dim, attributes: 1 }}> PROGRESS </text>
+          <text style={{ fg: THEME.text, attributes: 1 }}> PROGRESS </text>
           <box style={{ marginTop: 1, flexGrow: 1, flexDirection: "row" }}>
             <text style={{ fg: THEME.accent }}>
               {"█".repeat(
                 Math.round(
-                  ((currentStepIdx + 1) / STEPS.length) * (leftColWidth - 10),
+                  ((currentStepIdx + 1) / STEPS.length) * (leftColWidth - 20),
                 ),
               )}
             </text>
@@ -513,10 +518,10 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
                 Math.max(
                   0,
                   leftColWidth -
-                    10 -
+                    20 -
                     Math.round(
                       ((currentStepIdx + 1) / STEPS.length) *
-                        (leftColWidth - 10),
+                        (leftColWidth - 20),
                     ),
                 ),
               )}
@@ -530,10 +535,11 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
       </box>
       <box
         style={{
-          width: 30,
+          width: 40,
           borderStyle: "rounded",
           borderColor: THEME.border,
-          padding: 1,
+          paddingLeft: 1,
+          paddingRight: 1,
           flexDirection: "column",
         }}
       >

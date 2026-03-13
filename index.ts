@@ -20,6 +20,26 @@ import {
   RenderSession,
 } from "./src/types";
 
+const pipelineStageNames: Record<string, string[]> = {
+    'create': [
+        "Анализ аудио",
+        "Сканирование",
+        "AI фильтрация",
+        "Индексация",
+        "Монтаж",
+        "Рендеринг",
+        "Сборка",
+    ],
+    'edit': [
+        "Рендеринг",
+        "Сборка",
+    ],
+    'indexing': [
+        "Подготовка",
+        "Глубокий анализ",
+    ]
+}
+
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
@@ -27,7 +47,7 @@ ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 function makeConsoleCB(): PipelineCB {
   return {
-    stage: (n, t, l) => console.log(`[${n}/${t}] ${l}`),
+    stage: (n, t, l) => console.log(`[${n}/${t.length}] ${t[l]}`),
     info: (msg) => console.log(`  ${msg}`),
     renderTick: (_, __, done, total) => {
       const pct = Math.round((done / total) * 100);
@@ -135,7 +155,7 @@ async function runMainPipeline(
   };
 
   try {
-    cb.stage(1, TOTAL, "Анализ аудио");
+    cb.stage(1, pipelineStageNames.create, 0);
     cb.log("Converting MP3 to WAV...");
     await convertMp3ToWav(config.audio, TEMP_WAV);
 
@@ -145,7 +165,7 @@ async function runMainPipeline(
       `${audioAnalysis.tempo} BPM · ${audioAnalysis.style} · ${(audioAnalysis.energy * 100).toFixed(0)}% energy`,
     );
 
-    cb.stage(2, TOTAL, "Сканирование");
+    cb.stage(2, pipelineStageNames.create, 1);
     cb.log(`Reading directory: ${config.input}`);
     const allFiles = fs
       .readdirSync(config.input)
@@ -160,7 +180,7 @@ async function runMainPipeline(
       date: fs.statSync(path.join(config.input, file)).birthtime.toISOString(),
     }));
 
-    cb.stage(3, TOTAL, "AI фильтрация");
+    cb.stage(3, pipelineStageNames.create, 2);
     cb.log("Checking Ollama connection...");
     await checkOllamaAvailable(config.model);
 
@@ -175,7 +195,7 @@ async function runMainPipeline(
     }
     cb.info(`${requestedFileIds.length}/${allFiles.length} clips selected`);
 
-    cb.stage(4, TOTAL, `Индексация`);
+    cb.stage(4, pipelineStageNames.create, 3);
     cb.log(
       `Indexing ${requestedFileIds.length} clips (AI Vision + Metrics)...`,
     );
@@ -194,7 +214,7 @@ async function runMainPipeline(
     const quality = await resolveQuality(config.quality, allFilePaths);
     cb.info(`${quality.bitrate} Mbps · ${quality.x264preset}`);
 
-    cb.stage(5, TOTAL, "Монтаж");
+    cb.stage(5, pipelineStageNames.create, 4);
     cb.log("AI Director is building edit plan...");
     const plan = await createDirectorPlan(
       config.prompt,
@@ -209,7 +229,7 @@ async function runMainPipeline(
       `${plan.segments.length} scenes · ${plan.totalDuration.toFixed(1)}s`,
     );
 
-    cb.stage(6, TOTAL, "Рендеринг");
+    cb.stage(6, pipelineStageNames.create, 5);
     cb.log("Parallel segment rendering started...");
     const segProgressMap = new Map<number, number>();
     const segTotal = plan.segments.length;
@@ -230,7 +250,7 @@ async function runMainPipeline(
       },
     );
 
-    cb.stage(7, TOTAL, "Сборка");
+    cb.stage(7, pipelineStageNames.create, 6);
     cb.log("Final assembly and audio mixing...");
     const segmentConcatInfo = plan.segments.map((seg, i) => ({
       file: sliceResult.files[i] ?? seg.outputFile,
@@ -301,7 +321,7 @@ async function runEditPipeline(
       ),
     }));
 
-    cb.stage(1, 2, "Рендеринг");
+    cb.stage(1, pipelineStageNames.edit, 0);
     const segProgressMap = new Map<number, number>();
     const segTotal = segments.length;
 
@@ -321,7 +341,7 @@ async function runEditPipeline(
       },
     );
 
-    cb.stage(2, 2, "Сборка");
+    cb.stage(2, pipelineStageNames.edit, 1);
     const segmentConcatInfo = segments.map((seg, i) => ({
       file: sliceResult.files[i] ?? seg.outputFile,
       targetDuration: seg.targetDuration,
@@ -453,7 +473,7 @@ async function main(): Promise<void> {
     await showPipelineUI(
       { ...loadSavedConfig(), input: result.input, model: result.model } as any,
       async (cb) => {
-        cb.stage(1, 2, "Подготовка");
+        cb.stage(1, pipelineStageNames.indexing, 0);
         if (result.reindex) {
           cb.log(`Cleaning cache in: ${result.input}`);
           const sidecars = fs.existsSync(result.input)
@@ -474,7 +494,7 @@ async function main(): Promise<void> {
           cb.info("Using existing cache");
         }
 
-        cb.stage(2, 2, "Глубокий анализ");
+        cb.stage(2, pipelineStageNames.indexing, 1);
         cb.log(`Starting Vision AI indexing with model: ${result.model}`);
         await checkOllamaAvailable(result.model);
 
