@@ -12,7 +12,7 @@ interface Props {
     onNone?:    () => void;
 }
 
-export const FileBrowser: React.FC<Props> = ({ folder, extensions, label, onSelect, onManual, onNone }) => {
+export const FileBrowser = ({ folder, extensions, label, onSelect, onManual, onNone }: Props) => {
     const [files, setFiles] = useState<string[]>([]);
     const [loading, setLoading] = useState(true);
 
@@ -34,7 +34,7 @@ export const FileBrowser: React.FC<Props> = ({ folder, extensions, label, onSele
         }
     }, [folder]);
 
-    if (loading) return <text style={{ color: THEME.dim }}>Loading files...</text>;
+    if (loading) return <text style={{ fg: THEME.dim }}>Loading files...</text>;
 
     const items = [
         ...files.map(f => ({ name: `📄 ${f}`, description: 'Select this file', value: path.join(folder, f) })),
@@ -43,6 +43,6 @@ export const FileBrowser: React.FC<Props> = ({ folder, extensions, label, onSele
     ];
 
     return (
-        <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.accent, marginBottom: 1 }}>{label}:</text><select options={items} onSelect={(idx) => { const val = items[idx].value; if (val === 'manual') onManual(); else if (val === 'none') onNone?.(); else onSelect(val as string); }} focused={true} selectedBackgroundColor={THEME.accent} selectedTextColor="#ffffff" textColor={THEME.text} descriptionColor={THEME.dim} selectedDescriptionColor="#e2e8f0" style={{ flexGrow: 1 }} /></box>
+        <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ fg: THEME.accent, marginBottom: 1 }}>{label}:</text><select options={items} onSelect={(idx) => { const val = items[idx].value; if (val === 'manual') onManual(); else if (val === 'none') onNone?.(); else onSelect(val as string); }} focused={true} selectedBackgroundColor={THEME.accent} selectedTextColor="#ffffff" textColor={THEME.text} descriptionColor={THEME.dim} selectedDescriptionColor="#e2e8f0" style={{ flexGrow: 1 }} /></box>
     );
 };
