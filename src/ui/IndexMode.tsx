@@ -126,13 +126,12 @@ export const IndexMode = ({
         borderStyle: "rounded",
         borderColor: THEME.accent,
         padding: 1,
-        margin: 1,
         backgroundColor: THEME.background,
         width: "100%",
         height: "100%",
       }}
     >
-      <text style={{ fg: THEME.accent, attributes: 1, marginBottom: 1 }}>
+      <text style={{ fg: THEME.accent, attributes: 1, margin: 1 }}>
         {" "}
         ⟳ INDEXER{" "}
       </text>

@@ -386,6 +386,7 @@ export async function indexMediaFolder(
           duration,
         );
         const results: VisionAIResponse[] = [];
+        console.log(`-> Vision AI`);
         for (let j = 0; j < timestamps.length; j++) {
           const kt = Date.now();
           const imgPath = path.join(tempDir, `thumb_${filename}_${j}.jpg`);
@@ -397,7 +398,7 @@ export async function indexMediaFolder(
             );
             results.push(await evaluateFrameWithVisionAI(imgPath, visionModel));
             if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
-            console.log(`     [Frame ${j + 1}/${timestamps.length}] Vision AI`);
+            console.log(`- Frame ${j + 1}/${timestamps.length}`);
           } catch (e) {}
         }
         if (results.length > 0) {
