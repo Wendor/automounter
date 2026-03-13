@@ -108,6 +108,7 @@ export async function promptSetup(saved: Partial<Config>): Promise<Config> {
         lut:      lut    || path.join(process.cwd(), 'cinematic.cube'),
         output:   output || path.join(process.cwd(), 'final_edit.mp4'),
         model:    model  || 'llava:13b',
+        quality:  saved.quality ?? 'medium',
     };
 
     // Summary

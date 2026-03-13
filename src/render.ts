@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import ffmpeg from 'fluent-ffmpeg';
-import { VideoSegment, SliceResult, SegmentEffect } from './types';
+import { VideoSegment, SliceResult, SegmentEffect, RenderQuality } from './types';
 
 export type RenderProgressCallback = (segmentIndex: number, percent: number) => void;
 
@@ -50,15 +50,17 @@ function buildVideoFilter(
     segment: VideoSegment,
     lutFile: string,
     hasLut: boolean,
-    videoFadeDuration: number
+    videoFadeDuration: number,
+    quality: RenderQuality
 ): string {
+    // Масштаб для low-quality (720p) — ставится первым
+    const scaleFilter = quality.scale ? `scale=${quality.scale},` : '';
+
     // Motion blur: blend source frames when speeding up > ~1.5x
     const needsMotionBlur = segment.ptsFactor < 0.65;
-    // Разделение аргументов во fluent-ffmpeg позволяет безопасно использовать пробелы,
-    // поэтому возвращаем weights для более качественного блюра.
     const motionBlur = needsMotionBlur ? 'tmix=frames=3:weights=1 2 1,' : '';
 
-    let vf = `${motionBlur}setpts=${segment.ptsFactor}*PTS`;
+    let vf = `${scaleFilter}${motionBlur}setpts=${segment.ptsFactor}*PTS`;
 
     if (hasLut) {
         vf += `,lut3d='${formatLutPathForFFmpeg(lutFile)}'`;
@@ -88,21 +90,28 @@ function renderSegment(
     hasLut: boolean,
     lutFile: string,
     videoFadeDuration: number,
-    bitrate: number,
+    quality: RenderQuality,
     onProgress?: RenderProgressCallback
 ): Promise<void> {
-    const videoFilter = buildVideoFilter(segment, lutFile, hasLut, videoFadeDuration);
+    const videoFilter = buildVideoFilter(segment, lutFile, hasLut, videoFadeDuration, quality);
+
+    const outputOpts = [
+        '-c:v', codec,
+        '-b:v', `${quality.bitrate}M`,
+        '-an',
+        '-filter:v', videoFilter,
+        '-r', String(targetFps),
+        // Жёсткий обрез: гарантируем ровно targetDuration на выходе.
+        // Без этого setpts+граница кадра даёт дрейф ~1 кадр/сегмент → рассинхрон и freeze.
+        '-t', segment.targetDuration.toFixed(6),
+    ];
+    // preset поддерживается только libx264 (не videotoolbox)
+    if (codec === 'libx264') outputOpts.push('-preset', quality.x264preset);
 
     return new Promise((resolve, reject) => {
         ffmpeg(segment.sourceFile)
             .inputOptions(['-ss', String(segment.startTime), '-t', String(segment.rawDuration)])
-            .outputOptions([
-                '-c:v', codec,
-                '-b:v', `${bitrate}M`,
-                '-an',
-                '-filter:v', videoFilter,
-                '-r', String(targetFps),
-            ])
+            .outputOptions(outputOpts)
             .on('progress', (progress: { timemark?: string }) => {
                 if (progress.timemark && segment.rawDuration > 0) {
                     const secs = timemarkToSeconds(progress.timemark);
@@ -110,7 +119,7 @@ function renderSegment(
                 }
             })
             .on('end', () => { onProgress?.(index, 100); resolve(); })
-            .on('error', (err: Error) => { console.log(err); reject(err); })
+            .on('error', (err: Error) => reject(err))
             .save(segment.outputFile);
     });
 }
@@ -122,7 +131,7 @@ async function renderWithConcurrency(
     hasLut: boolean,
     lutFile: string,
     videoFadeDuration: number,
-    bitrate: number,
+    quality: RenderQuality,
     concurrency: number,
     onProgress?: RenderProgressCallback
 ): Promise<void> {
@@ -131,7 +140,7 @@ async function renderWithConcurrency(
         while (i < segments.length) {
             const idx = i++;
             const seg = segments[idx];
-            if (seg) await renderSegment(seg, idx, codec, targetFps, hasLut, lutFile, videoFadeDuration, bitrate, onProgress);
+            if (seg) await renderSegment(seg, idx, codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, onProgress);
         }
     };
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
@@ -143,14 +152,14 @@ export async function renderSegments(
     lutFile: string,
     videoFadeDuration: number,
     totalDuration: number,
-    bitrate: number,
+    quality: RenderQuality,
     onProgress?: RenderProgressCallback
 ): Promise<SliceResult> {
     if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
-    const codec      = detectVideoCodec();
-    const hasLut     = fs.existsSync(lutFile);
-    const targetFps  = computeMajorityFps(segments);
+    const codec       = detectVideoCodec();
+    const hasLut      = fs.existsSync(lutFile);
+    const targetFps   = computeMajorityFps(segments);
     const concurrency = codec === 'h264_videotoolbox' ? 3 : 2;
 
     if (!hasLut && lutFile) {
@@ -158,7 +167,7 @@ export async function renderSegments(
     }
 
     const generatedFiles = segments.map(s => s.outputFile);
-    await renderWithConcurrency(segments, codec, targetFps, hasLut, lutFile, videoFadeDuration, bitrate, concurrency, onProgress);
+    await renderWithConcurrency(segments, codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, concurrency, onProgress);
 
     return { files: generatedFiles, totalDuration, targetFps };
 }
@@ -170,18 +179,23 @@ function buildXfadeFiltergraph(
     audioInputIndex: number,
     totalDuration: number,
     audioFadeDuration: number
-): string[] {
+): { filterLines: string[]; actualVideoDuration: number } {
     const n = segments.length;
     const lines: string[] = [];
-    let sumDurations   = 0;
-    let sumTransitions = 0;
+    // Накапливаем позицию в выходной временной шкале.
+    // После каждого xfade видео короче на transitionDuration (перекрытие клипов).
+    let outputCursor = 0;
 
     for (let k = 0; k < n - 1; k++) {
-        const seg      = segments[k]!;
-        const tDur     = seg.transition === 'dissolve' ? seg.transitionDuration : 0.033;
-        sumDurations  += seg.targetDuration;
-        const offset   = sumDurations - sumTransitions;
-        sumTransitions += tDur;
+        const seg  = segments[k]!;
+        const tDur = seg.transition === 'dissolve' ? seg.transitionDuration : 0.033;
+
+        // offset = момент в выходной шкале, когда начинается переход,
+        // т.е. за tDur до конца текущего клипа.
+        outputCursor += seg.targetDuration;
+        const offset  = outputCursor - tDur;
+        // После перекрытия cursor «съедает» tDur у следующего клипа
+        outputCursor -= tDur;
 
         const inA  = k === 0 ? '[0:v]' : `[v${k}]`;
         const inB  = `[${k + 1}:v]`;
@@ -189,11 +203,14 @@ function buildXfadeFiltergraph(
 
         lines.push(`${inA}${inB}xfade=transition=fade:duration=${tDur.toFixed(3)}:offset=${offset.toFixed(3)}${outV}`);
     }
+    // Добавляем последний сегмент без перехода
+    outputCursor += segments[n - 1]!.targetDuration;
+    const actualVideoDuration = outputCursor;
 
-    const audioFadeStart = Math.max(0, totalDuration - audioFadeDuration);
+    const audioFadeStart = Math.max(0, actualVideoDuration - audioFadeDuration);
     lines.push(`[${audioInputIndex}:a]afade=t=out:st=${audioFadeStart}:d=${audioFadeDuration}[aout]`);
 
-    return lines;
+    return { filterLines: lines, actualVideoDuration };
 }
 
 function concatenateHardCuts(
@@ -241,17 +258,16 @@ function concatenateWithXfade(
     audioFadeDuration: number,
     outputFile: string,
     targetFps: number,
-    bitrate: number,
+    quality: RenderQuality,
     onProgress?: (percent: number) => void
 ): Promise<void> {
     const n = segments.length;
 
-    // Edge case: single segment, fall back to hard cut
     if (n === 1 && segments[0]) {
         return concatenateHardCuts([segments[0].file], audioFile, totalDuration, audioFadeDuration, outputFile, path.dirname(segments[0].file), onProgress);
     }
 
-    const filterLines = buildXfadeFiltergraph(segments, n, totalDuration, audioFadeDuration);
+    const { filterLines, actualVideoDuration } = buildXfadeFiltergraph(segments, n, totalDuration, audioFadeDuration);
 
     return new Promise((resolve, reject) => {
         let cmd = ffmpeg();
@@ -263,18 +279,17 @@ function concatenateWithXfade(
             .outputOptions([
                 '-map', '[vout]',
                 '-map', '[aout]',
-                // xfade requires decoded frames: use software encoder for compatibility
                 '-c:v', 'libx264',
-                '-b:v', `${bitrate}M`,
-                '-preset', 'fast',
+                '-b:v', `${quality.bitrate}M`,
+                '-preset', quality.x264preset,
                 '-r', String(targetFps),
                 '-c:a', 'aac',
                 '-b:a', '320k',
-                '-t', String(totalDuration),
+                '-t', String(actualVideoDuration),
             ])
             .on('progress', (p: { timemark?: string }) => {
-                if (p.timemark && totalDuration > 0) {
-                    onProgress?.(Math.min(99, (timemarkToSeconds(p.timemark) / totalDuration) * 100));
+                if (p.timemark && actualVideoDuration > 0) {
+                    onProgress?.(Math.min(99, (timemarkToSeconds(p.timemark) / actualVideoDuration) * 100));
                 }
             })
             .on('end', () => { onProgress?.(100); resolve(); })
@@ -291,7 +306,7 @@ export function concatenateAndAddMusic(
     outputFile: string,
     tempDir: string,
     targetFps: number,
-    bitrate: number,
+    quality: RenderQuality,
     onProgress?: (percent: number) => void
 ): Promise<void> {
     const hasDissolve = segments.some(s => s.transition === 'dissolve');
@@ -304,6 +319,6 @@ export function concatenateAndAddMusic(
     }
 
     return concatenateWithXfade(
-        segments, audioFile, totalDuration, audioFadeDuration, outputFile, targetFps, bitrate, onProgress
+        segments, audioFile, totalDuration, audioFadeDuration, outputFile, targetFps, quality, onProgress
     );
 }

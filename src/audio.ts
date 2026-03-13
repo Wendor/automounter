@@ -15,8 +15,10 @@ interface MusicTempoConstructor {
     new (audioData: Float32Array): MusicTempoInstance;
 }
 
-const wav: WavDecoder = require('node-wav') as WavDecoder;
-const MusicTempo: MusicTempoConstructor = require('music-tempo') as MusicTempoConstructor;
+import _wav from 'node-wav';
+import _MusicTempo from 'music-tempo';
+const wav = _wav as unknown as WavDecoder;
+const MusicTempo = _MusicTempo as unknown as MusicTempoConstructor;
 
 export function convertMp3ToWav(inputFile: string, outputFile: string): Promise<void> {
     return new Promise((resolve, reject) => {

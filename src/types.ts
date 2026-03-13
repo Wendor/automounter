@@ -80,3 +80,29 @@ export interface SliceResult {
     totalDuration: number;
     targetFps: number;  // majority fps across all rendered segments
 }
+
+// ─── Quality ──────────────────────────────────────────────────────────────────
+
+export type QualityLevel = 'low' | 'medium' | 'high';
+
+export interface RenderQuality {
+    bitrate: number;       // Mbps, всегда конкретное значение
+    x264preset: string;    // ultrafast | fast | slow
+    scale: string | null;  // null = оригинальное разрешение, 'w:h' = масштаб
+}
+
+export const QUALITY_TEMPLATES: Record<QualityLevel, RenderQuality & { label: string; description: string; bitrateAuto: boolean }> = {
+    low:    { label: 'Low (Preview)',  description: '720p · 8 Mbps · ultrafast', bitrate: 8,  x264preset: 'ultrafast', scale: '1280:720', bitrateAuto: false },
+    medium: { label: 'Medium',         description: 'full res · auto Mbps · fast', bitrate: 0,  x264preset: 'fast',      scale: null,       bitrateAuto: true  },
+    high:   { label: 'High',           description: 'full res · 80 Mbps · slow',  bitrate: 80, x264preset: 'slow',      scale: null,       bitrateAuto: false },
+};
+
+// ─── Render session (сохраняется в config.json для ре-рендера) ────────────────
+
+export interface RenderSession {
+    segments: VideoSegment[];
+    totalDuration: number;
+    targetFps: number;
+    audio: string;
+    renderedAt: string;
+}

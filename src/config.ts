@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { QualityLevel, RenderSession } from './types';
 
 export interface Config {
     input: string;
@@ -9,7 +10,9 @@ export interface Config {
     prompt: string;
     model: string;
     output: string;
-    bitrate: number;  // Mbps для видеовыхода
+    bitrate: number;          // Mbps, 0 = авто-определение
+    quality: QualityLevel;    // low | medium | high
+    lastSession?: RenderSession;
 }
 
 function parseArgs(argv: string[]): Partial<Config> {
@@ -25,6 +28,7 @@ function parseArgs(argv: string[]): Partial<Config> {
         if (arg === '--model'    && next) { result.model    = next; i++; }
         if (arg === '--output'   && next) { result.output   = next; i++; }
         if (arg === '--bitrate'  && next) { result.bitrate  = parseInt(next, 10); i++; }
+        if (arg === '--quality'  && next) { result.quality  = next as QualityLevel; i++; }
     }
     return result;
 }
@@ -62,7 +66,8 @@ export function loadConfig(): Config {
         prompt:   cli.prompt   ?? file.prompt   ?? '',
         model:    cli.model    ?? file.model    ?? 'llava:13b',
         output:   cli.output   ?? file.output   ?? path.join(process.cwd(), 'final_edit.mp4'),
-        bitrate:  cli.bitrate  ?? file.bitrate  ?? 0,   // 0 = авто-определение по исходникам
+        bitrate:  cli.bitrate  ?? file.bitrate  ?? 0,
+        quality:  cli.quality  ?? file.quality  ?? 'medium',
     };
 
     if (!merged.input)  throw new Error('--input is required (path to video folder)');

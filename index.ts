@@ -5,25 +5,38 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import ffprobeInstaller from '@ffprobe-installer/ffprobe';
 
-import { loadConfig, loadSavedConfig, saveConfig }    from './src/config';
-import { promptSetup, drawProgress, clearProgress }   from './src/ui';
-import { convertMp3ToWav, analyzeAudio }              from './src/audio';
-import { indexMediaFolder }                           from './src/indexer';
-import { createDirectorPlan, preFilterFiles }         from './src/director';
-import { renderSegments, concatenateAndAddMusic }     from './src/render';
-import { AudioAnalysis, VideoInfo, SliceResult }      from './src/types';
+import { loadConfig, loadSavedConfig, saveConfig }  from './src/config';
+import { convertMp3ToWav, analyzeAudio }             from './src/audio';
+import { indexMediaFolder }                          from './src/indexer';
+import { createDirectorPlan, preFilterFiles }        from './src/director';
+import { renderSegments, concatenateAndAddMusic }    from './src/render';
+import { showInkUI, showPipelineUI, PipelineCB }    from './src/ui/index';
+import {
+    AudioAnalysis, VideoInfo, SliceResult,
+    RenderQuality, QUALITY_TEMPLATES, RenderSession,
+} from './src/types';
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Console-based callbacks (batch / --batch mode) ───────────────────────────
 
-function stage(n: number, total: number, label: string): void {
-    console.log(`[${n}/${total}] ${label}`);
-}
-
-function info(msg: string): void {
-    console.log(`  ${msg}`);
+function makeConsoleCB(): PipelineCB {
+    return {
+        stage:            (n, t, l) => console.log(`[${n}/${t}] ${l}`),
+        info:             (msg)     => console.log(`  ${msg}`),
+        renderTick:       (_, __, done, total) => {
+            const pct = Math.round(done / total * 100);
+            process.stdout.write(`\r  Рендеринг: ${done}/${total}  ${'█'.repeat(Math.round(pct / 5))}${'░'.repeat(20 - Math.round(pct / 5))}  ${pct}%`);
+            if (done === total) process.stdout.write('\n');
+        },
+        assemblyProgress: (pct)    => {
+            process.stdout.write(`\r  Сборка: ${'█'.repeat(Math.round(pct / 5))}${'░'.repeat(20 - Math.round(pct / 5))}  ${pct.toFixed(0)}%`);
+            if (pct >= 100) process.stdout.write('\n');
+        },
+        done:             (path)   => console.log(`\n  Готово → ${path}\n`),
+        error:            (msg)    => console.error(`\n[Fatal] ${msg}\n`),
+    };
 }
 
 async function detectMedianBitrate(filePaths: string[]): Promise<number> {
@@ -41,6 +54,18 @@ async function detectMedianBitrate(filePaths: string[]): Promise<number> {
     return Math.min(80, Math.max(25, median));
 }
 
+async function resolveQuality(qualityLevel: string, filePaths: string[]): Promise<RenderQuality> {
+    const level = (qualityLevel as keyof typeof QUALITY_TEMPLATES) in QUALITY_TEMPLATES
+        ? qualityLevel as keyof typeof QUALITY_TEMPLATES
+        : 'medium';
+    const template = QUALITY_TEMPLATES[level];
+    const bitrate = template.bitrateAuto
+        ? await detectMedianBitrate(filePaths)
+        : template.bitrate;
+    if (template.bitrateAuto) console.log(`  Auto bitrate: ${bitrate} Mbps (медиана по ${filePaths.length} файлам)`);
+    return { bitrate, x264preset: template.x264preset, scale: template.scale };
+}
+
 async function checkOllamaAvailable(model: string): Promise<void> {
     let data: unknown;
     try {
@@ -49,7 +74,7 @@ async function checkOllamaAvailable(model: string): Promise<void> {
         data = await res.json();
     } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        throw new Error(`Ollama is not reachable: ${msg}\n  Start it with: ollama serve`);
+        throw new Error(`Ollama недоступен: ${msg}\n  Запусти: ollama serve`);
     }
 
     const modelBase = model.split(':')[0] ?? '';
@@ -61,29 +86,20 @@ async function checkOllamaAvailable(model: string): Promise<void> {
 
     if (!names.some(n => n.startsWith(modelBase))) {
         throw new Error(
-            `Model "${model}" is not pulled.\n` +
-            `  Available: ${names.join(', ') || 'none'}\n` +
-            `  Run: ollama pull ${model}`
+            `Модель "${model}" не установлена.\n` +
+            `  Доступные: ${names.join(', ') || 'нет'}\n` +
+            `  Запусти: ollama pull ${model}`
         );
     }
 }
 
-// ─── Main pipeline ────────────────────────────────────────────────────────────
+// ─── Основной пайплайн ────────────────────────────────────────────────────────
 
-async function runMainPipeline(): Promise<void> {
+async function runMainPipeline(
+    config: ReturnType<typeof loadConfig>,
+    cb: PipelineCB
+): Promise<void> {
     const TOTAL = 7;
-    const isBatch = !process.stdin.isTTY || process.argv.includes('--batch');
-
-    // ── Config (interactive or batch) ─────────────────────────────────────────
-    let config;
-    if (isBatch) {
-        config = loadConfig();
-    } else {
-        const saved = loadSavedConfig();
-        config = await promptSetup(saved);
-        saveConfig(config);
-    }
-
     const runId    = Date.now().toString(36);
     const TEMP_WAV = path.join(os.tmpdir(), `automounter_${runId}.wav`);
     const TEMP_DIR = path.join(os.tmpdir(), `automounter_${runId}`);
@@ -94,88 +110,61 @@ async function runMainPipeline(): Promise<void> {
     };
 
     try {
-        // ── Stage 1: Audio ─────────────────────────────────────────────────────
-        stage(1, TOTAL, 'Analyzing audio');
+        cb.stage(1, TOTAL, 'Анализ аудио');
         await convertMp3ToWav(config.audio, TEMP_WAV);
         const audioAnalysis: AudioAnalysis = analyzeAudio(TEMP_WAV);
-        info(`${audioAnalysis.tempo} BPM  |  style: ${audioAnalysis.style}  |  energy: ${(audioAnalysis.energy * 100).toFixed(0)}%  |  ${audioAnalysis.beats.length} beats  |  ${audioAnalysis.drops.length} drops`);
+        cb.info(`${audioAnalysis.tempo} BPM · ${audioAnalysis.style} · ${(audioAnalysis.energy * 100).toFixed(0)}% · ${audioAnalysis.beats.length} beats`);
 
-        // ── Stage 2: Scan ──────────────────────────────────────────────────────
-        stage(2, TOTAL, 'Scanning input folder');
+        cb.stage(2, TOTAL, 'Сканирование');
         const allFiles = fs.readdirSync(config.input)
             .filter(f => /\.(mp4|mov)$/i.test(f) && !f.startsWith('.'));
-
-        if (allFiles.length === 0) throw new Error(`No video files found in: ${config.input}`);
-        info(`${allFiles.length} video files found`);
+        if (allFiles.length === 0) throw new Error(`Видеофайлы не найдены в: ${config.input}`);
+        cb.info(`${allFiles.length} файлов`);
 
         const basicFilesInfo = allFiles.map(file => ({
             id:   file,
             date: fs.statSync(path.join(config.input, file)).birthtime.toISOString(),
         }));
 
-        // ── Stage 3: Filter ────────────────────────────────────────────────────
-        stage(3, TOTAL, 'Checking Ollama + filtering by prompt');
+        cb.stage(3, TOTAL, 'AI фильтрация');
         await checkOllamaAvailable(config.model);
         const requestedFileIds: string[] = await preFilterFiles(config.prompt, basicFilesInfo, config.model);
-
         if (requestedFileIds.length === 0) {
-            throw new Error(
-                'No files matched the date range in your prompt.\n' +
-                '  Check that the dates match your video file timestamps.'
-            );
+            throw new Error('Нет файлов в диапазоне дат. Проверь промпт.');
         }
+        cb.info(`${requestedFileIds.length}/${allFiles.length} файлов`);
 
-        // ── Stage 4: Index ─────────────────────────────────────────────────────
-        stage(4, TOTAL, `Indexing ${requestedFileIds.length} video(s) with Vision AI`);
+        cb.stage(4, TOTAL, `Индексация ${requestedFileIds.length} видео`);
         const videos: VideoInfo[] = await indexMediaFolder(
             config.input, TEMP_DIR, config.model, requestedFileIds
         );
 
-        // ── Bitrate: авто-определение по медиане исходников ───────────────────
-        if (config.bitrate === 0) {
-            const allFilePaths = requestedFileIds.map(f => path.join(config.input, f));
-            config.bitrate = await detectMedianBitrate(allFilePaths);
-            info(`Auto bitrate: ${config.bitrate} Mbps (median of ${requestedFileIds.length} source files)`);
-        }
+        const allFilePaths = requestedFileIds.map(f => path.join(config.input, f));
+        const quality = await resolveQuality(config.quality, allFilePaths);
+        cb.info(`${config.quality} · ${quality.bitrate} Mbps · ${quality.x264preset}${quality.scale ? ` · ${quality.scale}` : ''}`);
 
-        // ── Stage 5: Director ──────────────────────────────────────────────────
-        stage(5, TOTAL, 'Creating edit plan');
+        cb.stage(5, TOTAL, 'Монтаж');
         const plan = await createDirectorPlan(
             config.prompt, videos, audioAnalysis,
             config.duration, TEMP_DIR, config.model
         );
+        if (plan.segments.length === 0) throw new Error('Пустой план монтажа.');
+        cb.info(`${plan.segments.length} сегментов · ${plan.totalDuration.toFixed(1)}s`);
 
-        if (plan.segments.length === 0) throw new Error('Edit plan is empty. Try a different prompt.');
-        info(`${plan.segments.length} segments, ${plan.totalDuration.toFixed(1)}s total`);
-
-        // Plan details table
-        for (const seg of plan.segments) {
-            const speedPct = ((1 / seg.ptsFactor) * 100).toFixed(0);
-            const slomoTag = seg.slowMotionFactor < 1.0 ? '  [slow-mo]' : '';
-            info(`  ${path.basename(seg.sourceFile).padEnd(24)}  ${seg.effect.padEnd(9)}  ${speedPct.padStart(3)}% speed  ${seg.targetDuration.toFixed(1)}s${slomoTag}`);
-        }
-
-        // ── Stage 6: Render ────────────────────────────────────────────────────
-        stage(6, TOTAL, `Rendering ${plan.segments.length} segments`);
-
-        const segProgress = new Map<number, number>();
-        const total = plan.segments.length;
+        cb.stage(6, TOTAL, 'Рендеринг');
+        const segProgressMap = new Map<number, number>();
+        const segTotal = plan.segments.length;
 
         const sliceResult: SliceResult = await renderSegments(
-            plan.segments, TEMP_DIR, config.lut, 0.5, plan.totalDuration, config.bitrate,
+            plan.segments, TEMP_DIR, config.lut, 0.5, plan.totalDuration, quality,
             (segIdx, pct) => {
-                segProgress.set(segIdx, pct);
-                const overall = [...segProgress.values()].reduce((a, b) => a + b, 0) / total;
-                const done    = [...segProgress.values()].filter(p => p >= 100).length;
-                drawProgress('', overall, `${done}/${total} done`);
+                segProgressMap.set(segIdx, pct);
+                const done = [...segProgressMap.values()].filter(p => p >= 100).length;
+                cb.renderTick(segIdx, pct, done, segTotal);
             }
         );
-        clearProgress();
-        info('All segments rendered.');
 
-        // ── Stage 7: Assemble ──────────────────────────────────────────────────
-        stage(7, TOTAL, 'Assembling final video');
-
+        cb.stage(7, TOTAL, 'Сборка');
         const segmentConcatInfo = plan.segments.map((seg, i) => ({
             file:               sliceResult.files[i] ?? seg.outputFile,
             targetDuration:     seg.targetDuration,
@@ -183,65 +172,126 @@ async function runMainPipeline(): Promise<void> {
             transitionDuration: seg.transitionDuration,
         }));
 
-        const hasDissolve = segmentConcatInfo.some(s => s.transition === 'dissolve');
-        if (hasDissolve) info('Cross-dissolve transitions enabled (xfade)');
-
         await concatenateAndAddMusic(
             segmentConcatInfo, config.audio,
             sliceResult.totalDuration, 2.0,
             config.output, TEMP_DIR,
-            sliceResult.targetFps,
-            config.bitrate,
-            (pct) => drawProgress('', pct)
+            sliceResult.targetFps, quality,
+            (pct) => cb.assemblyProgress(pct)
         );
-        clearProgress();
 
+        const session: RenderSession = {
+            segments:      plan.segments,
+            totalDuration: plan.totalDuration,
+            targetFps:     sliceResult.targetFps,
+            audio:         config.audio,
+            renderedAt:    new Date().toISOString(),
+        };
+        config.lastSession = session;
+        saveConfig(config);
         cleanup();
-        console.log(`\n  Done → ${config.output}\n`);
+
+        cb.done(config.output);
 
     } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        clearProgress();
-        console.error(`\n[Fatal] ${msg}\n`);
         cleanup();
-        process.exit(1);
+        cb.error(msg);
+        throw error;
     }
 }
 
-// ─── Index-only mode ──────────────────────────────────────────────────────────
+// ─── Edit пайплайн ────────────────────────────────────────────────────────────
+
+async function runEditPipeline(
+    session: RenderSession,
+    lut: string,
+    qualityLevel: string,
+    output: string,
+    cb: PipelineCB
+): Promise<void> {
+    const runId    = Date.now().toString(36);
+    const TEMP_DIR = path.join(os.tmpdir(), `automounter_edit_${runId}`);
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+    const cleanup = () => fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+
+    try {
+        const filePaths = [...new Set(session.segments.map(s => s.sourceFile))];
+        const quality = await resolveQuality(qualityLevel, filePaths);
+        cb.info(`${qualityLevel} · ${quality.bitrate} Mbps · ${quality.x264preset}${quality.scale ? ` · ${quality.scale}` : ''}`);
+
+        const segments = session.segments.map((seg, i) => ({
+            ...seg,
+            outputFile: path.join(TEMP_DIR, `segment_${i.toString().padStart(3, '0')}.mp4`),
+        }));
+
+        cb.stage(1, 2, 'Рендеринг');
+        const segProgressMap = new Map<number, number>();
+        const segTotal = segments.length;
+
+        const sliceResult: SliceResult = await renderSegments(
+            segments, TEMP_DIR, lut, 0.5, session.totalDuration, quality,
+            (segIdx, pct) => {
+                segProgressMap.set(segIdx, pct);
+                const done = [...segProgressMap.values()].filter(p => p >= 100).length;
+                cb.renderTick(segIdx, pct, done, segTotal);
+            }
+        );
+
+        cb.stage(2, 2, 'Сборка');
+        const segmentConcatInfo = segments.map((seg, i) => ({
+            file:               sliceResult.files[i] ?? seg.outputFile,
+            targetDuration:     seg.targetDuration,
+            transition:         seg.transition,
+            transitionDuration: seg.transitionDuration,
+        }));
+
+        await concatenateAndAddMusic(
+            segmentConcatInfo, session.audio,
+            session.totalDuration, 2.0,
+            output, TEMP_DIR,
+            session.targetFps, quality,
+            (pct) => cb.assemblyProgress(pct)
+        );
+
+        cleanup();
+        cb.done(output);
+
+    } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        cleanup();
+        cb.error(msg);
+        throw error;
+    }
+}
+
+// ─── Index-only режим (CLI) ────────────────────────────────────────────────────
 
 async function runIndexOnly(): Promise<void> {
     const args    = process.argv.slice(2);
     const reindex = args.includes('--reindex');
-
-    // Минимальный конфиг: нужны только input и model
     const inputIdx = args.indexOf('--input');
     const modelIdx = args.indexOf('--model');
     const input = (inputIdx !== -1 ? args[inputIdx + 1] : undefined) ?? loadSavedConfig().input ?? '';
     const model = (modelIdx !== -1 ? args[modelIdx + 1] : undefined) ?? loadSavedConfig().model ?? 'llava:13b';
 
-    if (!input) {
-        console.error('\n[Fatal] --input is required for --index-only\n');
-        process.exit(1);
-    }
+    if (!input) { console.error('\n[Fatal] --input обязателен\n'); process.exit(1); }
 
     if (reindex) {
-        const sidecars = fs.readdirSync(input)
-            .filter(f => /\.(mp4|mov)\.json$/i.test(f));
+        const sidecars = fs.readdirSync(input).filter(f => /\.(mp4|mov)\.json$/i.test(f));
         if (sidecars.length > 0) {
             sidecars.forEach(f => fs.unlinkSync(path.join(input, f)));
-            console.log(`  Cleared ${sidecars.length} cache file(s).`);
+            console.log(`  Удалено ${sidecars.length} файлов кэша.`);
         }
     }
 
     const TEMP_DIR = path.join(os.tmpdir(), `automounter_idx_${Date.now().toString(36)}`);
-
     try {
-        console.log(`\n  Indexing: ${input}`);
-        console.log(`  Model:    ${model}\n`);
+        console.log(`\n  Индексация: ${input}\n  Модель:     ${model}\n`);
         await checkOllamaAvailable(model);
         const videos = await indexMediaFolder(input, TEMP_DIR, model);
-        console.log(`\n  Done. ${videos.length} file(s) indexed.\n`);
+        console.log(`\n  Готово. ${videos.length} файл(ов) проиндексировано.\n`);
     } catch (error: unknown) {
         console.error(`\n[Fatal] ${error instanceof Error ? error.message : String(error)}\n`);
         process.exit(1);
@@ -252,9 +302,55 @@ async function runIndexOnly(): Promise<void> {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-const argv = process.argv.slice(2);
-if (argv.includes('--index-only') || argv.includes('--reindex')) {
-    runIndexOnly();
-} else {
-    runMainPipeline();
+async function main(): Promise<void> {
+    const argv = process.argv.slice(2);
+
+    // CLI-режимы без UI
+    if (argv.includes('--index-only') || argv.includes('--reindex')) {
+        await runIndexOnly();
+        return;
+    }
+    if (argv.includes('--batch') || !process.stdin.isTTY) {
+        const config = loadConfig();
+        await runMainPipeline(config, makeConsoleCB());
+        return;
+    }
+
+    // Интерактивный режим — показываем ink UI
+    const saved = loadSavedConfig();
+    const result = await showInkUI(saved, process.cwd());
+
+    if (result.mode === 'create') {
+        saveConfig(result.config);
+        await showPipelineUI((cb) => runMainPipeline(result.config, cb));
+
+    } else if (result.mode === 'edit') {
+        const session = (saved.lastSession as RenderSession | undefined);
+        if (!session) { console.error('[Fatal] Нет сохранённой сессии.\n'); process.exit(1); }
+        await showPipelineUI((cb) => runEditPipeline(session, result.lut, result.quality, result.output, cb));
+
+    } else if (result.mode === 'index') {
+        if (result.reindex) {
+            const sidecars = fs.existsSync(result.input)
+                ? fs.readdirSync(result.input).filter(f => /\.(mp4|mov)\.json$/i.test(f))
+                : [];
+            if (sidecars.length > 0) {
+                sidecars.forEach(f => fs.unlinkSync(path.join(result.input, f)));
+                console.log(`  Удалено ${sidecars.length} файлов кэша.`);
+            }
+        }
+        const TEMP_DIR = path.join(os.tmpdir(), `automounter_idx_${Date.now().toString(36)}`);
+        try {
+            await checkOllamaAvailable(result.model);
+            const videos = await indexMediaFolder(result.input, TEMP_DIR, result.model);
+            console.log(`\n  Готово. ${videos.length} файл(ов) проиндексировано.\n`);
+        } finally {
+            if (fs.existsSync(TEMP_DIR)) fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+        }
+    }
 }
+
+main().catch(err => {
+    console.error(`\n[Fatal] ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+});
