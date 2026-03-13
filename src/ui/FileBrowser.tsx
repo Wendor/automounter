@@ -1,56 +1,48 @@
-import React from 'react';
-import { Box, Text } from 'ink';
-import SelectInput from 'ink-select-input';
+import React, { useState, useEffect } from 'react';
+import * as fs from 'fs';
 import * as path from 'path';
-import { scanFiles } from './helpers';
+import { THEME } from './index';
 
 interface Props {
-    folder: string;
+    folder:     string;
     extensions: string[];
-    label: string;
-    onSelect: (absolutePath: string) => void;
-    onManual: () => void;
-    onNone?: () => void;  // опциональная опция "Без файла"
+    label:      string;
+    onSelect:   (path: string) => void;
+    onManual:   () => void;
+    onNone?:    () => void;
 }
 
 export const FileBrowser: React.FC<Props> = ({ folder, extensions, label, onSelect, onManual, onNone }) => {
-    const files = scanFiles(folder, extensions);
+    const [files, setFiles] = useState<string[]>([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        try {
+            if (!fs.existsSync(folder)) {
+                setFiles([]);
+                setLoading(false);
+                return;
+            }
+            const items = fs.readdirSync(folder)
+                .filter(f => extensions.includes(path.extname(f).toLowerCase()))
+                .sort();
+            setFiles(items);
+        } catch (e) {
+            setFiles([]);
+        } finally {
+            setLoading(false);
+        }
+    }, [folder]);
+
+    if (loading) return <text style={{ color: THEME.dim }}>Loading files...</text>;
 
     const items = [
-        ...(onNone ? [{ label: '✕  Без файла', value: '__none__' }] : []),
-        ...files.map(f => ({ label: path.relative(folder, f), value: f })),
-        { label: '✎  Ввести вручную', value: '__manual__' },
+        ...files.map(f => ({ name: `📄 ${f}`, description: 'Select this file', value: path.join(folder, f) })),
+        { name: '✎ Manual input', description: 'Enter full path', value: 'manual' },
+        ...(onNone ? [{ name: '✕ No file', description: 'Continue without file', value: 'none' }] : []),
     ];
 
-    if (files.length === 0) {
-        // Папка пуста — сразу предлагаем ручной ввод
-        const emptyItems = [
-            ...(onNone ? [{ label: '✕  Без файла', value: '__none__' }] : []),
-            { label: '✎  Ввести вручную', value: '__manual__' },
-        ];
-        return (
-            <Box flexDirection="column">
-                <Text dimColor>  Папка {folder} пуста</Text>
-                <SelectInput items={emptyItems} onSelect={(item) => {
-                    if (item.value === '__none__') onNone?.();
-                    else onManual();
-                }} />
-            </Box>
-        );
-    }
-
     return (
-        <Box flexDirection="column">
-            <Text color="cyan">  {label}</Text>
-            <SelectInput
-                items={items}
-                limit={12}
-                onSelect={(item) => {
-                    if (item.value === '__manual__') onManual();
-                    else if (item.value === '__none__') onNone?.();
-                    else onSelect(item.value);
-                }}
-            />
-        </Box>
+        <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.accent, marginBottom: 1 }}>{label}:</text><select options={items} onSelect={(idx) => { const val = items[idx].value; if (val === 'manual') onManual(); else if (val === 'none') onNone?.(); else onSelect(val as string); }} focused={true} selectedBackgroundColor={THEME.accent} selectedTextColor="#ffffff" textColor={THEME.text} descriptionColor={THEME.dim} selectedDescriptionColor="#e2e8f0" style={{ flexGrow: 1 }} /></box>
     );
 };

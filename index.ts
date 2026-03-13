@@ -36,6 +36,7 @@ function makeConsoleCB(): PipelineCB {
         },
         done:             (path)   => console.log(`\n  Готово → ${path}\n`),
         error:            (msg)    => console.error(`\n[Fatal] ${msg}\n`),
+        log:              (msg)    => console.log(`  ${msg}`),
     };
 }
 
@@ -111,15 +112,20 @@ async function runMainPipeline(
 
     try {
         cb.stage(1, TOTAL, 'Анализ аудио');
+        cb.log('Converting MP3 to WAV...');
         await convertMp3ToWav(config.audio, TEMP_WAV);
+        
+        cb.log('Analyzing tempo, beats and transients...');
         const audioAnalysis: AudioAnalysis = analyzeAudio(TEMP_WAV);
-        cb.info(`${audioAnalysis.tempo} BPM · ${audioAnalysis.style} · ${(audioAnalysis.energy * 100).toFixed(0)}% · ${audioAnalysis.beats.length} beats`);
+        cb.info(`${audioAnalysis.tempo} BPM · ${audioAnalysis.style} · ${(audioAnalysis.energy * 100).toFixed(0)}% energy`);
 
         cb.stage(2, TOTAL, 'Сканирование');
+        cb.log(`Reading directory: ${config.input}`);
         const allFiles = fs.readdirSync(config.input)
             .filter(f => /\.(mp4|mov)$/i.test(f) && !f.startsWith('.'));
         if (allFiles.length === 0) throw new Error(`Видеофайлы не найдены в: ${config.input}`);
-        cb.info(`${allFiles.length} файлов`);
+        
+        cb.info(`${allFiles.length} files found`);
 
         const basicFilesInfo = allFiles.map(file => ({
             id:   file,
@@ -127,31 +133,39 @@ async function runMainPipeline(
         }));
 
         cb.stage(3, TOTAL, 'AI фильтрация');
+        cb.log('Checking Ollama connection...');
         await checkOllamaAvailable(config.model);
+        
+        cb.log('AI is filtering files by date range...');
         const requestedFileIds: string[] = await preFilterFiles(config.prompt, basicFilesInfo, config.model);
         if (requestedFileIds.length === 0) {
             throw new Error('Нет файлов в диапазоне дат. Проверь промпт.');
         }
-        cb.info(`${requestedFileIds.length}/${allFiles.length} файлов`);
+        cb.info(`${requestedFileIds.length}/${allFiles.length} clips selected`);
 
-        cb.stage(4, TOTAL, `Индексация ${requestedFileIds.length} видео`);
+        cb.stage(4, TOTAL, `Индексация`);
+        cb.log(`Indexing ${requestedFileIds.length} clips (AI Vision + Metrics)...`);
         const videos: VideoInfo[] = await indexMediaFolder(
-            config.input, TEMP_DIR, config.model, requestedFileIds
+            config.input, TEMP_DIR, config.model, requestedFileIds,
+            (done, total) => cb.renderTick(0, (done/total)*100, done, total)
         );
 
+        cb.log('Calculating optimal render quality...');
         const allFilePaths = requestedFileIds.map(f => path.join(config.input, f));
         const quality = await resolveQuality(config.quality, allFilePaths);
-        cb.info(`${config.quality} · ${quality.bitrate} Mbps · ${quality.x264preset}${quality.scale ? ` · ${quality.scale}` : ''}`);
+        cb.info(`${quality.bitrate} Mbps · ${quality.x264preset}`);
 
         cb.stage(5, TOTAL, 'Монтаж');
+        cb.log('AI Director is building edit plan...');
         const plan = await createDirectorPlan(
             config.prompt, videos, audioAnalysis,
             config.duration, TEMP_DIR, config.model
         );
         if (plan.segments.length === 0) throw new Error('Пустой план монтажа.');
-        cb.info(`${plan.segments.length} сегментов · ${plan.totalDuration.toFixed(1)}s`);
+        cb.info(`${plan.segments.length} scenes · ${plan.totalDuration.toFixed(1)}s`);
 
         cb.stage(6, TOTAL, 'Рендеринг');
+        cb.log('Parallel segment rendering started...');
         const segProgressMap = new Map<number, number>();
         const segTotal = plan.segments.length;
 
@@ -165,6 +179,7 @@ async function runMainPipeline(
         );
 
         cb.stage(7, TOTAL, 'Сборка');
+        cb.log('Final assembly and audio mixing...');
         const segmentConcatInfo = plan.segments.map((seg, i) => ({
             file:               sliceResult.files[i] ?? seg.outputFile,
             targetDuration:     seg.targetDuration,
@@ -281,7 +296,14 @@ async function runIndexOnly(): Promise<void> {
     if (reindex) {
         const sidecars = fs.readdirSync(input).filter(f => /\.(mp4|mov)\.json$/i.test(f));
         if (sidecars.length > 0) {
-            sidecars.forEach(f => fs.unlinkSync(path.join(input, f)));
+            sidecars.forEach(f => {
+                const fp = path.join(input, f);
+                try {
+                    if (fs.existsSync(fp) && fs.statSync(fp).isFile()) {
+                        fs.unlinkSync(fp);
+                    }
+                } catch (e) {}
+            });
             console.log(`  Удалено ${sidecars.length} файлов кэша.`);
         }
     }
@@ -322,32 +344,53 @@ async function main(): Promise<void> {
 
     if (result.mode === 'create') {
         saveConfig(result.config);
-        await showPipelineUI((cb) => runMainPipeline(result.config, cb));
+        await showPipelineUI(result.config, (cb) => runMainPipeline(result.config, cb));
 
     } else if (result.mode === 'edit') {
         const session = (saved.lastSession as RenderSession | undefined);
         if (!session) { console.error('[Fatal] Нет сохранённой сессии.\n'); process.exit(1); }
-        await showPipelineUI((cb) => runEditPipeline(session, result.lut, result.quality, result.output, cb));
+        const currentConfig = { ...loadSavedConfig(), lut: result.lut, quality: result.quality, output: result.output } as any;
+        await showPipelineUI(currentConfig, (cb) => runEditPipeline(session, result.lut, result.quality, result.output, cb));
 
     } else if (result.mode === 'index') {
-        if (result.reindex) {
-            const sidecars = fs.existsSync(result.input)
-                ? fs.readdirSync(result.input).filter(f => /\.(mp4|mov)\.json$/i.test(f))
-                : [];
-            if (sidecars.length > 0) {
-                sidecars.forEach(f => fs.unlinkSync(path.join(result.input, f)));
-                console.log(`  Удалено ${sidecars.length} файлов кэша.`);
+        await showPipelineUI({ ...loadSavedConfig(), input: result.input, model: result.model } as any, async (cb) => {
+            cb.stage(1, 2, 'Подготовка');
+            if (result.reindex) {
+                cb.log(`Cleaning cache in: ${result.input}`);
+                const sidecars = fs.existsSync(result.input)
+                    ? fs.readdirSync(result.input).filter(f => /\.(mp4|mov)\.json$/i.test(f))
+                    : [];
+                sidecars.forEach(f => {
+                    const fp = path.join(result.input, f);
+                    try {
+                        if (fs.existsSync(fp) && fs.statSync(fp).isFile()) {
+                            fs.unlinkSync(fp);
+                        }
+                    } catch (e) {}
+                });
+                cb.info(`Cache cleared (${sidecars.length} files)`);
+            } else {
+                cb.info('Using existing cache');
             }
-        }
-        const TEMP_DIR = path.join(os.tmpdir(), `automounter_idx_${Date.now().toString(36)}`);
-        try {
+
+            cb.stage(2, 2, 'Глубокий анализ');
+            cb.log(`Starting Vision AI indexing with model: ${result.model}`);
             await checkOllamaAvailable(result.model);
-            const videos = await indexMediaFolder(result.input, TEMP_DIR, result.model);
-            console.log(`\n  Готово. ${videos.length} файл(ов) проиндексировано.\n`);
-        } finally {
-            if (fs.existsSync(TEMP_DIR)) fs.rmSync(TEMP_DIR, { recursive: true, force: true });
-        }
+            
+            const TEMP_DIR = path.join(os.tmpdir(), `automounter_idx_${Date.now().toString(36)}`);
+            try {
+                const videos = await indexMediaFolder(result.input, TEMP_DIR, result.model, undefined, (done, total) => {
+                    cb.renderTick(0, (done/total)*100, done, total);
+                });
+                cb.info(`${videos.length} videos analyzed`);
+                cb.done('Indexing complete');
+            } finally {
+                if (fs.existsSync(TEMP_DIR)) fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+            }
+        });
     }
+    
+    process.exit(0);
 }
 
 main().catch(err => {

@@ -1,11 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Box, Text } from 'ink';
-import TextInput from 'ink-text-input';
-import SelectInput from 'ink-select-input';
+import { useTerminalDimensions } from '@opentui/react';
 import * as path from 'path';
 import { Config } from '../config';
 import { QualityLevel, QUALITY_TEMPLATES } from '../types';
 import { FileBrowser } from './FileBrowser';
+import { THEME } from './index';
 
 interface Props {
     saved: Partial<Config>;
@@ -28,46 +27,18 @@ const STEPS: Step[] = ['input','audio_choice','prompt','duration','lut_choice','
 const STEP_LABELS = ['Видео','Аудио','Промпт','Длит','LUT','Качество','Старт'];
 
 const QUALITY_ITEMS = (Object.keys(QUALITY_TEMPLATES) as QualityLevel[]).map(k => ({
-    label: `${QUALITY_TEMPLATES[k].label.padEnd(18)} ${QUALITY_TEMPLATES[k].description}`,
+    name: QUALITY_TEMPLATES[k].label,
+    description: QUALITY_TEMPLATES[k].description,
     value: k,
 }));
 
-// ─── Step breadcrumb ─────────────────────────────────────────────────────────
-
-const Breadcrumb: React.FC<{ step: Step }> = ({ step }) => {
-    const current = STEPS.indexOf(step);
-    return (
-        <Box marginBottom={1}>
-            {STEP_LABELS.map((label, i) => (
-                <Box key={i}>
-                    {i > 0 && <Text dimColor> › </Text>}
-                    <Text
-                        bold={i === current}
-                        color={i < current ? 'green' : i === current ? 'cyan' : undefined}
-                        dimColor={i > current}
-                    >
-                        {i < current ? '✓' : i === current ? '▸' : `${i + 1}`}{' '}{label}
-                    </Text>
-                </Box>
-            ))}
-        </Box>
-    );
+const truncate = (str: string, maxLen: number) => {
+    if (str.length <= maxLen) return str;
+    return '...' + str.slice(-(maxLen - 3));
 };
 
-// ─── Shared label/value row ───────────────────────────────────────────────────
-
-function Row({ label, value, dim }: { label: string; value?: string; dim?: boolean }) {
-    return (
-        <Box>
-            <Text dimColor>{('  ' + label + ':').padEnd(16)}</Text>
-            <Text dimColor={dim ?? !value}>{value ?? '—'}</Text>
-        </Box>
-    );
-}
-
-// ─── Main component ───────────────────────────────────────────────────────────
-
 export const CreateMode: React.FC<Props> = ({ saved, cwd, onDone, onBack }) => {
+    const { width } = useTerminalDimensions();
     const [step, setStep] = useState<Step>('input');
     const [form, setForm] = useState<Form>({
         input:    saved.input    ?? '',
@@ -82,11 +53,11 @@ export const CreateMode: React.FC<Props> = ({ saved, cwd, onDone, onBack }) => {
     const [inputVal, setInputVal] = useState('');
     const [error, setError] = useState('');
 
-    const lutsDir  = path.join(cwd, 'luts');
-    const musicDir = path.join(cwd, 'music');
+    const currentStepIdx = STEPS.indexOf(step === 'audio_browse' || step === 'audio_manual' ? 'audio_choice' : 
+                                       step === 'lut_browse' || step === 'lut_manual' ? 'lut_choice' : step);
+
     const set = (field: keyof Form, value: string) => setForm(f => ({ ...f, [field]: value }));
 
-    // Пре-fill: при переходе на шаг с текстовым вводом подставляем текущее значение
     useEffect(() => {
         const prefill: Partial<Record<Step, () => string>> = {
             input:        () => form.input,
@@ -99,240 +70,85 @@ export const CreateMode: React.FC<Props> = ({ saved, cwd, onDone, onBack }) => {
         setError('');
     }, [step]);
 
-    const renderStep = () => {
-        switch (step) {
+    const selectStyles = {
+        selectedBackgroundColor: THEME.accent,
+        selectedTextColor: "#ffffff",
+        textColor: THEME.text,
+        descriptionColor: THEME.dim,
+        selectedDescriptionColor: "#e2e8f0",
+        style: { flexGrow: 1 }
+    };
 
-            // ── Папка с видео ─────────────────────────────────────────────────
+    const renderInput = () => {
+        switch (step) {
             case 'input':
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  Папка с видео</Text>
-                        <Box>
-                            <Text dimColor>  {'> '}</Text>
-                            <TextInput
-                                value={inputVal}
-                                placeholder={form.input || '/Volumes/...'}
-                                onChange={setInputVal}
-                                onSubmit={(v) => {
-                                    const val = v.trim() || form.input;
-                                    if (!val) { setError('Укажи папку'); return; }
-                                    set('input', val); setStep('audio_choice');
-                                }}
-                            />
-                        </Box>
-                        {error && <Text color="red">  {error}</Text>}
-                    </Box>
+                    <box style={{ flexDirection: 'column' }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Укажите папку с видео:</text><input value={inputVal} placeholder={form.input || '/path/to/video'} onInput={setInputVal} onSubmit={(v) => { const val = v.trim() || form.input; if (!val) { setError('Укажи папку'); return; } set('input', val); setStep('audio_choice'); }} focused={true} style={{ textColor: THEME.text }} /></box>
                 );
-
-            // ── Аудио ─────────────────────────────────────────────────────────
             case 'audio_choice':
+                const audioItems = [
+                    ...(form.audio ? [{ name: 'Оставить текущий', description: path.basename(form.audio), value: 'keep' }] : []),
+                    { name: '♪ Из папки music/', description: 'Выбрать файл', value: 'browse' },
+                    { name: '✎ Ввести вручную', description: 'Полный путь', value: 'manual' },
+                ];
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  Аудиодорожка</Text>
-                        <SelectInput
-                            items={[
-                                ...(form.audio ? [{ label: `↩  ${path.basename(form.audio)}`, value: 'keep' }] : []),
-                                { label: '♪  Выбрать из папки music/', value: 'browse' },
-                                { label: '✎  Ввести вручную',          value: 'manual' },
-                            ]}
-                            onSelect={(item: { value: string }) => {
-                                if (item.value === 'keep')   setStep('prompt');
-                                else if (item.value === 'browse') setStep('audio_browse');
-                                else setStep('audio_manual');
-                            }}
-                        />
-                    </Box>
+                    <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Аудиодорожка:</text><select options={audioItems} onSelect={(idx) => { const val = audioItems[idx].value; if (val === 'keep') setStep('prompt'); else if (val === 'browse') setStep('audio_browse'); else setStep('audio_manual'); }} focused={true} {...selectStyles} /></box>
                 );
-
             case 'audio_browse':
                 return (
-                    <FileBrowser
-                        folder={musicDir}
-                        extensions={['.mp3', '.wav', '.aac', '.m4a']}
-                        label="Аудиодорожка"
-                        onSelect={(p) => { set('audio', p); setStep('prompt'); }}
-                        onManual={() => setStep('audio_manual')}
-                    />
+                    <FileBrowser folder={path.join(cwd, 'music')} extensions={['.mp3', '.wav', '.aac', '.m4a']} label="Выберите аудиофайл" onSelect={(p) => { set('audio', p); setStep('prompt'); }} onManual={() => setStep('audio_manual')} />
                 );
-
             case 'audio_manual':
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  Путь к аудио</Text>
-                        <Box>
-                            <Text dimColor>  {'> '}</Text>
-                            <TextInput
-                                value={inputVal}
-                                placeholder={form.audio || './track.mp3'}
-                                onChange={setInputVal}
-                                onSubmit={(v) => {
-                                    const val = v.trim() || form.audio;
-                                    if (!val) { setError('Укажи файл'); return; }
-                                    set('audio', val); setStep('prompt');
-                                }}
-                            />
-                        </Box>
-                        {error && <Text color="red">  {error}</Text>}
-                    </Box>
+                    <box style={{ flexDirection: 'column' }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Путь к аудио:</text><input value={inputVal} placeholder={form.audio || './track.mp3'} onInput={setInputVal} onSubmit={(v) => { const val = v.trim() || form.audio; if (!val) { setError('Укажи файл'); return; } set('audio', val); setStep('prompt'); }} focused={true} style={{ textColor: THEME.text }} /></box>
                 );
-
-            // ── Промпт ────────────────────────────────────────────────────────
             case 'prompt':
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  Промпт для монтажа</Text>
-                        <Box>
-                            <Text dimColor>  {'> '}</Text>
-                            <TextInput
-                                value={inputVal}
-                                placeholder={form.prompt || 'Эпичный ролик с природой...'}
-                                onChange={setInputVal}
-                                onSubmit={(v) => {
-                                    const val = v.trim() || form.prompt;
-                                    if (!val) { setError('Укажи промпт'); return; }
-                                    set('prompt', val); setStep('duration');
-                                }}
-                            />
-                        </Box>
-                        {error && <Text color="red">  {error}</Text>}
-                    </Box>
+                    <box style={{ flexDirection: 'column' }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Промпт для монтажа:</text><input value={inputVal} placeholder={form.prompt || 'Эпичный ролик...'} onInput={setInputVal} onSubmit={(v) => { const val = v.trim() || form.prompt; if (!val) { setError('Укажи промпт'); return; } set('prompt', val); setStep('duration'); }} focused={true} style={{ textColor: THEME.text }} /></box>
                 );
-
-            // ── Длительность ──────────────────────────────────────────────────
             case 'duration':
-                return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  Длительность (секунды)</Text>
-                        <Box>
-                            <Text dimColor>  {'> '}</Text>
-                            <TextInput
-                                value={inputVal}
-                                placeholder={form.duration}
-                                onChange={setInputVal}
-                                onSubmit={(v) => {
-                                    set('duration', v.trim() || form.duration);
-                                    setStep('lut_choice');
-                                }}
-                            />
-                        </Box>
-                    </Box>
+                 return (
+                    <box style={{ flexDirection: 'column' }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Длительность (сек):</text><input value={inputVal} placeholder={form.duration} onInput={setInputVal} onSubmit={(v) => { set('duration', v.trim() || form.duration); setStep('lut_choice'); }} focused={true} style={{ textColor: THEME.text }} /></box>
                 );
-
-            // ── LUT ───────────────────────────────────────────────────────────
             case 'lut_choice':
+                const lutItems = [
+                    ...(form.lut ? [{ name: 'Оставить текущий', description: path.basename(form.lut), value: 'keep' }] : []),
+                    { name: '◈ Из папки luts/', description: 'Выбрать файл', value: 'browse' },
+                    { name: '✕ Без LUT', description: 'Отключить цветокор', value: 'none'   },
+                    { name: '✎ Ввести вручную', description: 'Путь к .cube', value: 'manual' },
+                ];
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  LUT цветокоррекция</Text>
-                        <SelectInput
-                            items={[
-                                ...(form.lut ? [{ label: `↩  ${path.basename(form.lut)}`, value: 'keep' }] : []),
-                                { label: '◈  Выбрать из папки luts/', value: 'browse' },
-                                { label: '✕  Без LUT',                value: 'none'   },
-                                { label: '✎  Ввести вручную',         value: 'manual' },
-                            ]}
-                            onSelect={(item: { value: string }) => {
-                                if (item.value === 'keep')   setStep('quality');
-                                else if (item.value === 'none')   { set('lut', ''); setStep('quality'); }
-                                else if (item.value === 'browse') setStep('lut_browse');
-                                else setStep('lut_manual');
-                            }}
-                        />
-                    </Box>
+                    <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.accent, marginBottom: 1 }}>LUT цветокоррекция:</text><select options={lutItems} onSelect={(idx) => { const val = lutItems[idx].value; if (val === 'keep') setStep('quality'); else if (val === 'none') { set('lut', ''); setStep('quality'); } else if (val === 'browse') setStep('lut_browse'); else setStep('lut_manual'); }} focused={true} {...selectStyles} /></box>
                 );
-
             case 'lut_browse':
                 return (
-                    <FileBrowser
-                        folder={lutsDir}
-                        extensions={['.cube', '.3dl']}
-                        label="LUT файл"
-                        onSelect={(p) => { set('lut', p); setStep('quality'); }}
-                        onManual={() => setStep('lut_manual')}
-                        onNone={() => { set('lut', ''); setStep('quality'); }}
-                    />
+                    <FileBrowser folder={path.join(cwd, 'luts')} extensions={['.cube', '.3dl']} label="Выберите LUT файл" onSelect={(p) => { set('lut', p); setStep('quality'); }} onManual={() => setStep('lut_manual')} onNone={() => { set('lut', ''); setStep('quality'); }} />
                 );
-
             case 'lut_manual':
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  Путь к LUT (.cube)</Text>
-                        <Box>
-                            <Text dimColor>  {'> '}</Text>
-                            <TextInput
-                                value={inputVal}
-                                placeholder={form.lut || './cinematic.cube'}
-                                onChange={setInputVal}
-                                onSubmit={(v) => { set('lut', v.trim() || form.lut); setStep('quality'); }}
-                            />
-                        </Box>
-                    </Box>
+                    <box style={{ flexDirection: 'column' }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Путь к LUT (.cube):</text><input value={inputVal} placeholder={form.lut || './cinematic.cube'} onInput={setInputVal} onSubmit={(v) => { set('lut', v.trim() || form.lut); setStep('quality'); }} focused={true} style={{ textColor: THEME.text }} /></box>
                 );
-
-            // ── Качество ──────────────────────────────────────────────────────
             case 'quality':
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text color="cyan" bold>  Качество рендера</Text>
-                        <SelectInput
-                            items={QUALITY_ITEMS}
-                            initialIndex={QUALITY_ITEMS.findIndex(i => i.value === form.quality)}
-                            onSelect={(item: { value: string }) => { set('quality', item.value); setStep('confirm'); }}
-                        />
-                    </Box>
+                    <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Качество рендера:</text><select options={QUALITY_ITEMS} onSelect={(idx) => { set('quality', QUALITY_ITEMS[idx].value); setStep('confirm'); }} focused={true} {...selectStyles} /></box>
                 );
-
-            // ── Подтверждение ─────────────────────────────────────────────────
-            case 'confirm': {
-                const q = QUALITY_TEMPLATES[form.quality];
+            case 'confirm':
+                const confirmItems = [
+                    { name: '▶ Запустить', description: 'Начать рендеринг', value: 'go'   },
+                    { name: '↩ Назад', description: 'В главное меню', value: 'back' },
+                ];
                 return (
-                    <Box flexDirection="column" gap={1}>
-                        <Text bold color="green">  Готово к запуску</Text>
-                        <Box flexDirection="column">
-                            <Row label="Видео"        value={form.input} />
-                            <Row label="Аудио"        value={path.basename(form.audio)} />
-                            <Row label="Промпт"       value={form.prompt.slice(0, 50) + (form.prompt.length > 50 ? '…' : '')} />
-                            <Row label="Длительность" value={form.duration + 's'} />
-                            <Row label="LUT"          value={form.lut ? path.basename(form.lut) : '—'} dim={!form.lut} />
-                            <Row label="Качество"     value={`${q.label} — ${q.description}`} />
-                        </Box>
-                        <SelectInput
-                            items={[
-                                { label: '▶  Запустить', value: 'go'   },
-                                { label: '↩  Назад',     value: 'back' },
-                            ]}
-                            onSelect={(item: { value: string }) => {
-                                if (item.value === 'back') { onBack(); return; }
-                                onDone({
-                                    input:    form.input,
-                                    audio:    form.audio,
-                                    prompt:   form.prompt,
-                                    duration: parseInt(form.duration, 10) || 60,
-                                    lut:      form.lut || path.join(cwd, 'cinematic.cube'),
-                                    model:    form.model,
-                                    output:   form.output,
-                                    bitrate:  0,
-                                    quality:  form.quality,
-                                });
-                            }}
-                        />
-                    </Box>
+                    <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.success, bold: true, marginBottom: 1 }}>Готово к запуску!</text><select options={confirmItems} selectedIndex={0} onSelect={(idx) => { const val = confirmItems[idx].value; if (val === 'back') { onBack(); return; } onDone({ input: form.input, audio: form.audio, prompt: form.prompt, duration: parseInt(form.duration, 10) || 60, lut: form.lut || path.join(cwd, 'cinematic.cube'), model: form.model, output: form.output, bitrate: 0, quality: form.quality }); }} focused={true} {...selectStyles} /></box>
                 );
-            }
+            default:
+                return <text>Шаг {step} еще не реализован</text>;
         }
     };
 
+    const leftColWidth = width - 32;
+    const maxValLen = leftColWidth - 16;
+
     return (
-        <Box
-            flexDirection="column"
-            borderStyle="round"
-            borderColor="cyan"
-            paddingX={2}
-            paddingY={1}
-            marginX={1}
-            marginY={1}
-        >
-            <Breadcrumb step={step} />
-            {renderStep()}
-        </Box>
+        <box style={{ flexDirection: 'row', width: '100%', height: '100%', padding: 1, backgroundColor: THEME.background }}><box style={{ flexDirection: 'column', flexGrow: 1, marginRight: 1 }}><box style={{ height: 11, borderStyle: 'round', borderColor: THEME.border, padding: 1, marginBottom: 1, flexDirection: 'column' }}><text style={{ bold: true, color: THEME.accent }}> PROJECT CONFIG </text><box style={{ flexDirection: 'column', marginTop: 1 }}><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Video: </text></box><text style={{ color: THEME.highlight }}>{truncate(form.input || '—', maxValLen)}</text></box><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Audio: </text></box><text style={{ color: THEME.highlight }}>{truncate(path.basename(form.audio) || '—', maxValLen)}</text></box><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Prompt: </text></box><text style={{ color: THEME.highlight }}>{truncate(form.prompt || '—', maxValLen)}</text></box><box style={{ flexDirection: 'row', marginTop: 1 }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Duration: </text></box><box style={{ width: 10 }}><text style={{ color: THEME.highlight }}>{form.duration}s</text></box><box style={{ width: 12, marginLeft: 2 }}><text style={{ color: THEME.dim }}>Quality: </text></box><text style={{ color: THEME.highlight }}>{form.quality}</text></box></box></box><box style={{ flexGrow: 1, borderStyle: 'round', borderColor: THEME.accent, padding: 1, marginBottom: 1, flexDirection: 'column' }}><text style={{ bold: true, color: THEME.text }}> DATA INPUT </text><box style={{ marginTop: 1, flexGrow: 1, flexDirection: 'column' }}>{renderInput()}</box>{error ? <text style={{ color: THEME.error, marginTop: 1 }}>✗ {error}</text> : null}</box><box style={{ height: 5, borderStyle: 'round', borderColor: THEME.border, padding: 1, flexDirection: 'column' }}><text style={{ bold: true, color: THEME.dim }}> PROGRESS </text><box style={{ marginTop: 1, flexGrow: 1, flexDirection: 'row' }}><text style={{ color: THEME.accent }}>{'█'.repeat(Math.round(((currentStepIdx + 1) / STEPS.length) * (leftColWidth - 10)))}</text><text style={{ color: THEME.border }}>{'░'.repeat(Math.max(0, (leftColWidth - 10) - Math.round(((currentStepIdx + 1) / STEPS.length) * (leftColWidth - 10))))}</text><text style={{ color: THEME.text }}> {Math.round(((currentStepIdx + 1) / STEPS.length) * 100)}%</text></box></box></box><box style={{ width: 30, borderStyle: 'round', borderColor: THEME.border, padding: 1, flexDirection: 'column' }}><text style={{ bold: true, color: THEME.dim }}> STEPS </text><box style={{ flexDirection: 'column', marginTop: 1, flexGrow: 1 }}>{STEP_LABELS.map((label, i) => (<box key={i} style={{ marginBottom: 1, flexDirection: 'row' }}><text style={{ color: i < currentStepIdx ? THEME.success : i === currentStepIdx ? THEME.accent : THEME.dim, bold: i === currentStepIdx }}>{i < currentStepIdx ? '✓' : i === currentStepIdx ? '▸' : '·'} {label}</text></box>))}</box></box></box>
     );
 };

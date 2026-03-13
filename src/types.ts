@@ -21,13 +21,15 @@ export interface AudioSection {
 export interface AudioAnalysis {
     tempo: string;
     beats: number[];          // beat timestamps in seconds
+    subBeats: number[];       // 1/2 beats for fast segments
+    peaks: number[];          // timestamps (sec) of local energy maxima (transients)
     style: AudioStyle;        // overall track character
     energy: number;           // overall normalized RMS, 0–1
     drops: number[];          // timestamps (sec) of energy spikes after silence
     sections: AudioSection[]; // 2-second windowed breakdown
 }
 
-export type SegmentEffect = 'fadeIn' | 'fadeOut' | 'flashIn' | 'flashOut' | 'cut' | 'none';
+export type SegmentEffect = 'fadeIn' | 'fadeOut' | 'flashIn' | 'flashOut' | 'cut' | 'zoomIn' | 'zoomOut' | 'none';
 
 export interface ValidZone {
     start: number;
@@ -40,6 +42,11 @@ export interface VideoInfo {
     duration: number;
     creationDate: string;
     validZones: ValidZone[];
+    location?: {
+        lat: number;
+        lon: number;
+        address?: string;
+    };
     fps?: number;             // detected native frame rate
     aestheticScore?: number;
     description?: string;

@@ -3,7 +3,7 @@ import * as path from 'path';
 import ffmpeg from 'fluent-ffmpeg';
 import { VideoInfo, ValidZone } from './types';
 
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 8; 
 const DEV_NULL = process.platform === 'win32' ? 'NUL' : '/dev/null';
 
 interface VisionAIResponse {
@@ -16,6 +16,7 @@ interface VisionAIResponse {
     motion: string;
     dominantColors: string[];
     motionEstimate: number;
+    detectedObjects: string[];
 }
 
 interface CacheFile extends VideoInfo {
@@ -23,103 +24,119 @@ interface CacheFile extends VideoInfo {
     _fileSize?: number;
 }
 
-// ─── Combined video metrics (black frames + scene changes) ────────────────────
-// Single FFmpeg pass: scaled to 640px, 10fps — much faster than full-res decode.
-// On macOS uses VideoToolbox hardware decoding for 4K footage.
-
 interface VideoMetrics {
     blackIntervals: ValidZone[];
     sceneChanges: number[];
 }
 
-function analyzeVideoMetrics(filePath: string, duration: number): Promise<VideoMetrics> {
+function safeString(input: any): string | null {
+    if (typeof input === 'string') return input.trim();
+    if (typeof input === 'object' && input !== null) {
+        const val = input.name || input.tag || input.label || input.object || Object.values(input)[0];
+        if (typeof val === 'string') return val.trim();
+    }
+    return null;
+}
+
+function cleanAiArray(input: any): string[] {
+    if (!Array.isArray(input)) return [];
+    return input.map(safeString).filter((s): s is string => s !== null && s !== '' && s !== '[object Object]');
+}
+
+async function fetchAddress(lat: number, lon: number): Promise<string | undefined> {
+    try {
+        const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&addressdetails=1`;
+        const res = await fetch(url, { headers: { 'User-Agent': 'AutomounterVideoBot/1.0' } });
+        if (res.ok) {
+            const data: any = await res.json();
+            const a = data.address;
+            const city = a.city || a.town || a.village || a.suburb || a.county || '';
+            const country = a.country || '';
+            return city && country ? `${city}, ${country}` : country || city || undefined;
+        }
+    } catch (e) {}
+    return undefined;
+}
+
+function extractGpsFromSrt(srtPath: string): { lat: number, lon: number } | undefined {
+    try {
+        if (!fs.existsSync(srtPath)) return undefined;
+        const content = fs.readFileSync(srtPath, 'utf8').slice(0, 20000); 
+        const latMatch = content.match(/\[latitude:\s*([+-]?\d+\.\d+)\]/i);
+        const lonMatch = content.match(/\[longitude:\s*([+-]?\d+\.\d+)\]/i);
+        if (latMatch && lonMatch) {
+            const lat = parseFloat(latMatch[1]!);
+            const realLon = parseFloat(lonMatch[1]!);
+            if (!isNaN(lat) && !isNaN(realLon)) return { lat, lon: realLon };
+        }
+    } catch (e) {}
+    return undefined;
+}
+
+function extractGpsData(tags: any, videoPath: string): { lat: number, lon: number, source: string } | undefined {
+    const srtPath = videoPath.replace(/\.[^.]+$/, '.srt');
+    const srtGps = extractGpsFromSrt(srtPath);
+    if (srtGps) return { ...srtGps, source: 'SRT' };
+    const locTag = tags?.location || tags?.['com.apple.quicktime.location.ISO6709'] || tags?.['com.dji.common.model.GPS'];
+    if (locTag && typeof locTag === 'string') {
+        const isoMatch = locTag.match(/([+-]\d+\.\d+)([+-]\d+\.\d+)/);
+        if (isoMatch) {
+            const lat = parseFloat(isoMatch[1]!);
+            const lon = parseFloat(isoMatch[2]!);
+            if (!isNaN(lat) && !isNaN(lon)) return { lat, lon, source: 'Meta' };
+        }
+    }
+    return undefined;
+}
+
+async function analyzeVideoMetrics(filePath: string, duration: number): Promise<VideoMetrics> {
     return new Promise(resolve => {
         const blackIntervals: ValidZone[] = [];
         const sceneChanges: number[]     = [];
         const stderrLines: string[]      = [];
-
-        // Scale to 640px wide + 10fps is more than enough for both analyses.
-        // blackdetect runs on all frames; select+showinfo emits scene-change timestamps.
-        const vf = [
-            'scale=640:-1',
-            'fps=fps=3',
-            'blackdetect=d=0.1:pic_th=0.90:pix_th=0.10',
-            "select='gt(scene,0.3)',showinfo",
-        ].join(',');
-
-        // hwaccel videotoolbox на macOS критически важен для 4K: GPU-декодинг
-        // в разы быстрее CPU-декодинга даже с последующим GPU→CPU переносом кадров.
-        const hwaccel = process.platform === 'darwin'
-            ? ['-hwaccel', 'videotoolbox']
-            : [];
-
-        ffmpeg(filePath)
-            .inputOptions([...hwaccel, '-t', String(Math.min(duration, 600))])
-            .outputOptions(['-vf', vf, '-an', '-f', 'null'])
-            .on('stderr', (line: string) => stderrLines.push(line))
-            .on('end', () => {
-                for (const line of stderrLines) {
-                    const blackRe = /black_start:([\d.]+)\s+black_end:([\d.]+)/g;
-                    const sceneRe = /pts_time:([\d.]+)/g;
-                    let m: RegExpExecArray | null;
-                    while ((m = blackRe.exec(line)) !== null) {
-                        blackIntervals.push({ start: parseFloat(m[1]!), end: parseFloat(m[2]!) });
-                    }
-                    while ((m = sceneRe.exec(line)) !== null) {
-                        sceneChanges.push(parseFloat(m[1]!));
-                    }
-                }
-                resolve({ blackIntervals, sceneChanges });
-            })
-            .on('error', () => resolve({ blackIntervals: [], sceneChanges: [] }))
-            .save(DEV_NULL);
+        const vf = ['scale=320:-1', 'blackdetect=d=0.1:pic_th=0.90:pix_th=0.10', "select='gt(scene,0.4)',showinfo"].join(',');
+        const inputOpts = [];
+        if (process.platform === 'darwin') inputOpts.push('-hwaccel', 'videotoolbox');
+        inputOpts.push('-skip_frame', 'nokey', '-t', String(Math.min(duration, 600)));
+        ffmpeg(filePath).inputOptions(inputOpts).outputOptions(['-vf', vf, '-an', '-f', 'null']).on('stderr', (line: string) => stderrLines.push(line)).on('end', () => {
+            for (const line of stderrLines) {
+                const blackRe = /black_start:([\d.]+)\s+black_end:([\d.]+)/g;
+                const sceneRe = /pts_time:([\d.]+)/g;
+                let m: RegExpExecArray | null;
+                while ((m = blackRe.exec(line)) !== null) blackIntervals.push({ start: parseFloat(m[1]!), end: parseFloat(m[2]!) });
+                while ((m = sceneRe.exec(line)) !== null) sceneChanges.push(parseFloat(m[1]!));
+            }
+            resolve({ blackIntervals, sceneChanges });
+        }).on('error', (err) => { resolve({ blackIntervals: [], sceneChanges: [] }); }).save(DEV_NULL);
     });
 }
 
 function calculateValidZones(duration: number, blackIntervals: ValidZone[] = []): ValidZone[] {
-    const margin = duration * 0.15;
+    const margin = duration * 0.1;
     const safeStart = margin;
     const safeEnd = duration - margin;
-
-    if (safeEnd <= safeStart) {
-        return [{ start: Math.min(0.5, duration / 3), end: Math.max(duration - 0.5, duration * 0.66) }];
-    }
-
-    if (blackIntervals.length === 0) {
-        return [{ start: safeStart, end: safeEnd }];
-    }
-
+    if (safeEnd <= safeStart) return [{ start: 0, end: duration }];
+    if (blackIntervals.length === 0) return [{ start: safeStart, end: safeEnd }];
     const zones: ValidZone[] = [];
     let cursor = safeStart;
-
     for (const black of [...blackIntervals].sort((a, b) => a.start - b.start)) {
         if (black.end <= cursor) continue;
-        if (black.start > cursor) {
-            zones.push({ start: cursor, end: Math.min(black.start, safeEnd) });
-        }
+        if (black.start > cursor) zones.push({ start: cursor, end: Math.min(black.start, safeEnd) });
         cursor = Math.max(cursor, black.end);
         if (cursor >= safeEnd) break;
     }
-
     if (cursor < safeEnd) zones.push({ start: cursor, end: safeEnd });
-
     const usable = zones.filter(z => z.end - z.start >= 1.0);
     return usable.length > 0 ? usable : [{ start: safeStart, end: safeEnd }];
 }
 
-function selectKeyframeTimes(activeZone: ValidZone, sceneChanges: number[], maxFrames = 5): number[] {
+function selectKeyframeTimes(activeZone: ValidZone, sceneChanges: number[], duration: number): number[] {
+    const maxFrames = Math.min(10, Math.max(4, Math.floor(duration / 15)));
     const zoneLen = activeZone.end - activeZone.start;
     const inZone  = sceneChanges.filter(t => t >= activeZone.start && t <= activeZone.end);
-
-    if (inZone.length === 0) {
-        return [0.25, 0.50, 0.75].map(p => activeZone.start + zoneLen * p);
-    }
-
-    // Include the start-of-zone anchor and up to maxFrames-1 scene change points
+    if (inZone.length === 0) return Array.from({ length: maxFrames }, (_, i) => activeZone.start + (zoneLen * (i + 1)) / (maxFrames + 1));
     return [activeZone.start, ...inZone].slice(0, maxFrames);
 }
-
-// ─── FPS detection ────────────────────────────────────────────────────────────
 
 function parseFps(rFrameRate: string | undefined): number {
     if (!rFrameRate) return 30;
@@ -129,19 +146,9 @@ function parseFps(rFrameRate: string | undefined): number {
     return fps > 0 && fps <= 120 ? Math.round(fps * 100) / 100 : 30;
 }
 
-// ─── Vision AI ───────────────────────────────────────────────────────────────
-
 function extractKeyframe(videoPath: string, timeInSeconds: number, outputPath: string): Promise<void> {
     return new Promise((resolve, reject) => {
-        ffmpeg(videoPath)
-            .screenshots({
-                timestamps: [timeInSeconds],
-                filename: path.basename(outputPath),
-                folder: path.dirname(outputPath),
-                size: '640x?'
-            })
-            .on('end', () => resolve())
-            .on('error', (err: Error) => reject(err));
+        ffmpeg(videoPath).screenshots({ timestamps: [timeInSeconds], filename: path.basename(outputPath), folder: path.dirname(outputPath), size: '1280x?' }).on('end', () => resolve()).on('error', (err: Error) => reject(err));
     });
 }
 
@@ -154,72 +161,28 @@ function cleanJSONString(rawStr: string): string {
 async function evaluateFrameWithVisionAI(imagePath: string, modelName: string): Promise<VisionAIResponse> {
     const imageBuffer = fs.readFileSync(imagePath);
     const base64Image = imageBuffer.toString('base64');
-
-    const promptText = `You are an expert film colorist and video archivist. Analyze this drone frame in detail.
-Return ONLY a valid JSON object with these keys:
-"score" (number 1-10, aesthetic quality and cinematic composition),
-"description" (string, detailed scene description with mood, 1-2 sentences),
-"tags" (array of 3-5 strings: subjects like "river", "bridge", "sunset", "forest"),
-"timeOfDay" (string: "morning", "noon", "golden hour", "dusk", "night", "overcast"),
-"landscape" (string: "forest", "urban", "water", "mountains", "field", "road", "coast"),
-"cameraAngle" (string: "top-down", "horizon", "low-angle", "oblique"),
-"motion" (string: "flying forward", "panning left", "static hovering", "tracking", "ascending", "descending"),
-"dominantColors" (array of 2-3 hex color codes for dominant palette, e.g. ["#1a3a5c","#f4a261"]),
-"motionEstimate" (number 0.0-1.0, estimated movement/dynamics in the frame).
-No markdown, no explanations, only JSON.`;
-
+    const promptText = `Analyze this drone frame. Return ONLY JSON: {"score": 1-10, "description": "detailed summary", "tags": [], "detectedObjects": [], "timeOfDay", "landscape", "cameraAngle", "motion", "dominantColors": [], "motionEstimate": 0.0-1.0}. No markdown, only JSON.`;
     try {
-        const response = await fetch('http://localhost:11434/api/generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: modelName, prompt: promptText, images: [base64Image], format: 'json', stream: false, keep_alive: '10m' })
+        const response = await fetch('http://localhost:11434/api/generate', { 
+            method: 'POST', 
+            headers: { 'Content-Type': 'application/json' }, 
+            body: JSON.stringify({ 
+                model: modelName, 
+                prompt: promptText, 
+                images: [base64Image], 
+                format: 'json', 
+                stream: false, 
+                keep_alive: '20m' // Явно держим модель в памяти 20 минут
+            }) 
         });
-
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const data: unknown = await response.json();
-        if (typeof data === 'object' && data !== null && 'response' in data) {
-            const rawText = String((data as Record<string, unknown>).response);
-            const parsed  = JSON.parse(cleanJSONString(rawText)) as Record<string, unknown>;
-
-            if ('score' in parsed) {
-                return {
-                    score:          Number(parsed.score) || 5,
-                    description:    String(parsed.description || 'Unknown'),
-                    tags:           Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
-                    timeOfDay:      String(parsed.timeOfDay || 'Unknown'),
-                    landscape:      String(parsed.landscape || 'Unknown'),
-                    cameraAngle:    String(parsed.cameraAngle || 'Unknown'),
-                    motion:         String(parsed.motion || 'Unknown'),
-                    dominantColors: Array.isArray(parsed.dominantColors) ? parsed.dominantColors.map(String) : [],
-                    motionEstimate: typeof parsed.motionEstimate === 'number' ? parsed.motionEstimate : 0.5,
-                };
-            }
-        }
+        const data: any = await response.json();
+        const parsed = JSON.parse(cleanJSONString(data.response));
+        return { score: Number(parsed.score) || 5, description: String(parsed.description || ''), tags: cleanAiArray(parsed.tags), detectedObjects: cleanAiArray(parsed.detectedObjects), timeOfDay: String(parsed.timeOfDay || 'unknown'), landscape: String(parsed.landscape || 'unknown'), cameraAngle: String(parsed.cameraAngle || 'horizon'), motion: String(parsed.motion || 'static'), dominantColors: Array.isArray(parsed.dominantColors) ? parsed.dominantColors.map(String) : [], motionEstimate: Number(parsed.motionEstimate) || 0.5 };
     } catch {
-        // fall through to defaults
+        return { score: 5, description: 'failed', tags: [], detectedObjects: [], timeOfDay: 'unknown', landscape: 'unknown', cameraAngle: 'unknown', motion: 'unknown', dominantColors: [], motionEstimate: 0.5 };
     }
-
-    return { score: 5, description: 'Analysis failed', tags: [], timeOfDay: 'Unknown', landscape: 'Unknown', cameraAngle: 'Unknown', motion: 'Unknown', dominantColors: [], motionEstimate: 0.5 };
 }
-
-const MOTION_KEYWORDS: Array<[string, number]> = [
-    ['static', 0.1], ['hovering', 0.15], ['panning', 0.35], ['rotating', 0.4],
-    ['ascending', 0.45], ['descending', 0.45], ['tracking', 0.65], ['flying', 0.6],
-    ['fast', 0.85], ['racing', 0.9],
-];
-
-function motionToIntensity(motion: string): number {
-    const lower = motion.toLowerCase();
-    for (const [kw, val] of MOTION_KEYWORDS) {
-        if (lower.includes(kw)) return val;
-    }
-    return 0.5;
-}
-
-// ─── Proxy file lookup ────────────────────────────────────────────────────────
-// DJI и некоторые другие камеры кладут рядом .lrf — облегчённую версию видео.
-// Используем её для анализа и извлечения кадров; оригинал только для рендера.
 
 function findProxyFile(filePath: string): string | null {
     const proxyPath = filePath.replace(/\.[^.]+$/, '.lrf');
@@ -229,161 +192,81 @@ function findProxyFile(filePath: string): string | null {
     return null;
 }
 
-// ─── Logging helpers ──────────────────────────────────────────────────────────
-
-function sec(ms: number): string {
-    return (ms / 1000).toFixed(1) + 's';
-}
-
-function stepLine(label: string, elapsed: string, detail: string): void {
-    console.log(`         ${label.padEnd(10)} ${elapsed.padStart(5)}  │  ${detail}`);
-}
-
-// ─── Main export ──────────────────────────────────────────────────────────────
-
-export async function indexMediaFolder(
-    dirPath: string,
-    tempDir: string,
-    visionModel: string,
-    requestedFiles?: string[]
-): Promise<VideoInfo[]> {
+export async function indexMediaFolder(dirPath: string, tempDir: string, visionModel: string, requestedFiles?: string[], onProgress?: (done: number, total: number) => void): Promise<VideoInfo[]> {
     if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-
-    let files = fs.readdirSync(dirPath)
-        .filter(f => /\.(mp4|mov)$/i.test(f) && !f.startsWith('.'));
-
-    if (requestedFiles && requestedFiles.length > 0) {
-        files = files.filter(f => requestedFiles.includes(f));
-    }
-
-    if (files.length === 0) throw new Error('No matching video files found in folder.');
-
-    const total  = files.length;
+    let files = fs.readdirSync(dirPath).filter(f => /\.(mp4|mov)$/i.test(f) && !f.startsWith('.'));
+    if (requestedFiles && requestedFiles.length > 0) files = files.filter(f => requestedFiles.includes(f));
     const videos: VideoInfo[] = [];
-    let   cached = 0;
+    const addressCache = new Map<string, string>();
 
-    for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
-        const filename    = files[fileIdx]!;
-        const filePath    = path.join(dirPath, filename);
+    for (let i = 0; i < files.length; i++) {
+        const startFile = Date.now();
+        const filename = files[i]!;
+        const filePath = path.join(dirPath, filename);
         const metadataPath = `${filePath}.json`;
-        const currentSize  = fs.statSync(filePath).size;
-        const prefix       = `  [${fileIdx + 1}/${total}]`;
-
-        // ── Cache check ──────────────────────────────────────────────────────
+        const stats = fs.statSync(filePath);
         if (fs.existsSync(metadataPath)) {
             try {
                 const cache = JSON.parse(fs.readFileSync(metadataPath).toString()) as CacheFile;
-                if (cache._cacheVersion === CACHE_VERSION && cache._fileSize === currentSize) {
-                    cached++;
-                    console.log(`${prefix} ${filename}  ${cached === 1 ? '' : ''}[cache]`);
-                    const { _cacheVersion: _v, _fileSize: _s, ...info } = cache;
-                    videos.push(info as VideoInfo);
+                if (cache._cacheVersion === CACHE_VERSION && cache._fileSize === stats.size) {
+                    videos.push(cache as VideoInfo);
+                    onProgress?.(i + 1, files.length);
                     continue;
                 }
-            } catch { /* fall through */ }
-            fs.unlinkSync(metadataPath);
+            } catch {}
         }
-
-        const fileStart = Date.now();
-        console.log(`${prefix} ${filename}`);
-
-        // ── ffprobe ──────────────────────────────────────────────────────────
-        let t = Date.now();
-        const stats = fs.statSync(filePath);
-        const probeData: ffmpeg.FfprobeData = await new Promise((res, rej) => {
-            ffmpeg.ffprobe(filePath, (err, data) => err ? rej(err) : res(data));
-        });
-        const duration    = probeData.format.duration || 0;
-        const videoStream = probeData.streams.find(s => s.codec_type === 'video');
-        const detectedFps = parseFps(videoStream?.r_frame_rate as string | undefined);
-        const resolution  = videoStream ? `${videoStream.width ?? '?'}×${videoStream.height ?? '?'}` : '?';
-        const proxyFile = findProxyFile(filePath);
-        stepLine('ffprobe', sec(Date.now() - t),
-            `${duration.toFixed(1)}s clip  |  ${detectedFps} fps  |  ${resolution}  |  ${(currentSize / 1e6).toFixed(0)} MB${proxyFile ? '  |  proxy ✓' : ''}`);
-
-        // ── Combined analysis: black frames + scene changes (single FFmpeg pass) ─
-        // Используем proxy (.lrf) если доступен — намного быстрее для 4K оригиналов.
-        t = Date.now();
-        const { blackIntervals, sceneChanges } = await analyzeVideoMetrics(proxyFile ?? filePath, duration);
-        const validZones = calculateValidZones(duration, blackIntervals);
-        const analyzeDetail = blackIntervals.length === 0 && sceneChanges.length === 0
-            ? 'no black frames, no scene changes'
-            : [
-                blackIntervals.length > 0 ? `${blackIntervals.length} black interval(s) → ${validZones.length} valid zone(s)` : 'no black frames',
-                sceneChanges.length > 0   ? `${sceneChanges.length} scene changes` : 'no scene changes',
-              ].join('  |  ');
-        stepLine('analyze', sec(Date.now() - t), analyzeDetail);
-
-        const videoInfo: VideoInfo = {
-            id: filename, filePath, duration,
-            creationDate: stats.birthtime.toISOString(),
-            validZones, fps: detectedFps,
-        };
-
-        const activeZone = [...validZones].sort((a, b) => (b.end - b.start) - (a.end - a.start))[0];
-
-        if (activeZone) {
-            const timestamps  = selectKeyframeTimes(activeZone, sceneChanges, 5);
-            const frameDetail = sceneChanges.length === 0
-                ? `no scene changes → ${timestamps.length} evenly-spaced frames`
-                : `${sceneChanges.length} scene changes → ${timestamps.length} frames at ${sceneChanges.slice(0, 4).map(s => s.toFixed(1) + 's').join(', ')}${sceneChanges.length > 4 ? '…' : ''}`;
-            stepLine('keyframes', '—', frameDetail);
-
-            // ── Keyframe extraction ──────────────────────────────────────────
-            t = Date.now();
-            const tempImages = timestamps.map((_, i) =>
-                path.join(tempDir, `thumb_${filename.replace(/[^a-z0-9]/gi, '_')}_${i}.jpg`)
-            );
-            await Promise.all(timestamps.map((ts, i) => extractKeyframe(proxyFile ?? filePath, ts, tempImages[i]!)));
-            stepLine('extract', sec(Date.now() - t),
-                `${timestamps.length} frame(s) at ${timestamps.map(ts => ts.toFixed(1) + 's').join(', ')}`);
-
-            // ── Vision AI — sequential for per-frame progress ────────────────
-            const results: VisionAIResponse[] = [];
-            for (let i = 0; i < tempImages.length; i++) {
-                const imgPath = tempImages[i]!;
-                t = Date.now();
-                const result = await evaluateFrameWithVisionAI(imgPath, visionModel);
-                results.push(result);
-                if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
-                stepLine(
-                    `vision ${i + 1}/${tempImages.length}`,
-                    sec(Date.now() - t),
-                    `score=${result.score}  ${result.landscape}  ${result.timeOfDay}  ${result.motion}`
-                );
+        try {
+            console.log(`[${i + 1}/${files.length}] Indexing: ${filename}`);
+            const probeData: any = await new Promise((res, rej) => ffmpeg.ffprobe(filePath, (err, data) => err ? rej(err) : res(data)));
+            const videoStream = probeData.streams.find((s: any) => s.codec_type === 'video');
+            if (!videoStream) { onProgress?.(i + 1, files.length); continue; }
+            
+            const gpsInfo = extractGpsData(probeData.format?.tags, filePath);
+            let location: VideoInfo['location'] | undefined = undefined;
+            if (gpsInfo) {
+                console.log(`  -> GPS (${gpsInfo.source}): ${gpsInfo.lat.toFixed(4)}, ${gpsInfo.lon.toFixed(4)}`);
+                const cacheKey = `${gpsInfo.lat.toFixed(3)},${gpsInfo.lon.toFixed(3)}`;
+                let address = addressCache.get(cacheKey);
+                if (!address) {
+                    address = await fetchAddress(gpsInfo.lat, gpsInfo.lon);
+                    if (address) {
+                        addressCache.set(cacheKey, address);
+                        console.log(`  -> Location: ${address}`);
+                    }
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+                location = { lat: gpsInfo.lat, lon: gpsInfo.lon, address };
             }
 
-            // ── Aggregate ────────────────────────────────────────────────────
-            const avgScore = results.reduce((s, r) => s + r.score, 0) / results.length;
-            const best     = results.reduce((a, b) => a.score > b.score ? a : b);
-            const bestIdx  = results.indexOf(best);
-            const bestTime = timestamps[bestIdx] ?? timestamps[Math.floor(timestamps.length / 2)] ?? activeZone.start;
-
-            videoInfo.aestheticScore       = avgScore;
-            videoInfo.description          = best.description;
-            videoInfo.tags                 = [...new Set(results.flatMap(r => r.tags))];
-            videoInfo.timeOfDay            = best.timeOfDay;
-            videoInfo.landscape            = best.landscape;
-            videoInfo.cameraAngle          = best.cameraAngle;
-            videoInfo.motion               = best.motion;
-            videoInfo.dominantColors       = best.dominantColors;
-            videoInfo.motionIntensity      = Math.max(best.motionEstimate, motionToIntensity(best.motion));
-            videoInfo.isSlowMotionSuitable = (videoInfo.motionIntensity < 0.4) && (avgScore >= 7);
-            videoInfo.bestSegments = [{
-                start: Math.max(activeZone.start, bestTime - 3),
-                end:   Math.min(activeZone.end,   bestTime + 3),
-            }];
-
-            const totalSec = sec(Date.now() - fileStart);
-            console.log(`         ${'─'.repeat(52)}`);
-            console.log(`         avg score: ${avgScore.toFixed(1)}  │  best: frame ${bestIdx + 1}  │  ${best.landscape}  │  ${best.timeOfDay}  │  total: ${totalSec}`);
-            console.log(`         tags: ${videoInfo.tags.slice(0, 6).join(', ')}`);
-        }
-
-        const cacheData: CacheFile = { ...videoInfo, _cacheVersion: CACHE_VERSION, _fileSize: currentSize };
-        fs.writeFileSync(metadataPath, JSON.stringify(cacheData, null, 2));
-        videos.push(videoInfo);
+            const duration = probeData.format.duration || 0;
+            const proxyFile = findProxyFile(filePath);
+            const { blackIntervals, sceneChanges } = await analyzeVideoMetrics(proxyFile ?? filePath, duration);
+            console.log(`  -> Metrics: scenes: ${sceneChanges.length}, black: ${blackIntervals.length}`);
+            const validZones = calculateValidZones(duration, blackIntervals);
+            const activeZone = [...validZones].sort((a, b) => (b.end - b.start) - (a.end - a.start))[0];
+            if (activeZone) {
+                const timestamps = selectKeyframeTimes(activeZone, sceneChanges, duration);
+                const results: VisionAIResponse[] = [];
+                for (let j = 0; j < timestamps.length; j++) {
+                    const kt = Date.now();
+                    const imgPath = path.join(tempDir, `thumb_${filename}_${j}.jpg`);
+                    try {
+                        await extractKeyframe(proxyFile ?? filePath, timestamps[j]!, imgPath);
+                        results.push(await evaluateFrameWithVisionAI(imgPath, visionModel));
+                        if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+                        console.log(`     [Frame ${j+1}/${timestamps.length}] Vision AI`);
+                    } catch (e) {}
+                }
+                if (results.length > 0) {
+                    const best = results.reduce((a, b) => a.score > b.score ? a : b);
+                    const videoInfo: VideoInfo = { id: filename, filePath, duration, creationDate: stats.birthtime.toISOString(), validZones, fps: parseFps(videoStream.r_frame_rate), location, aestheticScore: results.reduce((s, r) => s + r.score, 0) / results.length, description: best.description, tags: [...new Set(results.flatMap(r => [...r.tags, ...r.detectedObjects]))], timeOfDay: best.timeOfDay, landscape: best.landscape, cameraAngle: best.cameraAngle, motion: best.motion, dominantColors: best.dominantColors, motionIntensity: Math.max(...results.map(r => r.motionEstimate)), isSlowMotionSuitable: Math.max(...results.map(r => r.motionEstimate)) < 0.3, bestSegments: [{ start: activeZone.start, end: activeZone.end }] };
+                    fs.writeFileSync(metadataPath, JSON.stringify({ ...videoInfo, _cacheVersion: CACHE_VERSION, _fileSize: stats.size }, null, 2));
+                    videos.push(videoInfo);
+                    console.log('  -> Done');
+                }
+            }
+        } catch (e) { console.error(`  ! Error: ${(e as Error).message}`); }
+        onProgress?.(i + 1, files.length);
     }
-
     return videos;
 }

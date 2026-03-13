@@ -1,12 +1,9 @@
-import React, { useState, useEffect } from 'react';
-import { Box, Text } from 'ink';
-import TextInput from 'ink-text-input';
-import SelectInput from 'ink-select-input';
+import React, { useState } from 'react';
+import { useTerminalDimensions } from '@opentui/react';
 import * as path from 'path';
 import { QualityLevel, QUALITY_TEMPLATES, RenderSession } from '../types';
 import { FileBrowser } from './FileBrowser';
-
-interface EditResult { lut: string; quality: QualityLevel; output: string; }
+import { THEME } from './index';
 
 interface Props {
     session:        RenderSession;
@@ -14,214 +11,77 @@ interface Props {
     currentQuality: QualityLevel;
     currentOutput:  string;
     cwd:            string;
-    onDone:  (result: EditResult) => void;
-    onBack:  () => void;
+    onDone:         (res: { lut: string; quality: QualityLevel; output: string }) => void;
+    onBack:         () => void;
 }
 
-type Step = 'info' | 'lut_choice' | 'lut_browse' | 'lut_manual' | 'quality' | 'output' | 'confirm';
-
 const QUALITY_ITEMS = (Object.keys(QUALITY_TEMPLATES) as QualityLevel[]).map(k => ({
-    label: `${QUALITY_TEMPLATES[k].label.padEnd(18)} ${QUALITY_TEMPLATES[k].description}`,
+    name: QUALITY_TEMPLATES[k].label,
+    description: QUALITY_TEMPLATES[k].description,
     value: k,
 }));
 
-export const EditMode: React.FC<Props> = ({
-    session, currentLut, currentQuality, currentOutput, cwd, onDone, onBack,
-}) => {
-    const [step,     setStep]     = useState<Step>('info');
-    const [lut,      setLut]      = useState(currentLut);
-    const [quality,  setQuality]  = useState<QualityLevel>(currentQuality);
-    const [output,   setOutput]   = useState(currentOutput);
+const truncate = (str: string, maxLen: number) => {
+    if (str.length <= maxLen) return str;
+    return '...' + str.slice(-(maxLen - 3));
+};
+
+export const EditMode: React.FC<Props> = ({ session, currentLut, currentQuality, currentOutput, cwd, onDone, onBack }) => {
+    const { width } = useTerminalDimensions();
+    const [step, setStep] = useState<'lut_choice' | 'lut_browse' | 'lut_manual' | 'quality' | 'output' | 'confirm'>('lut_choice');
+    const [lut, setLut] = useState(currentLut);
+    const [quality, setQuality] = useState(currentQuality);
+    const [output, setOutput] = useState(currentOutput);
     const [inputVal, setInputVal] = useState('');
 
-    const lutsDir      = path.join(cwd, 'luts');
-    const renderedAt   = new Date(session.renderedAt).toLocaleString('ru-RU');
-    const defaultOutput = currentOutput.replace(/(\.\w+)$/, `_edit_${Date.now().toString(36)}$1`);
+    const selectStyles = {
+        selectedBackgroundColor: THEME.accent,
+        selectedTextColor: "#ffffff",
+        textColor: THEME.text,
+        descriptionColor: THEME.dim,
+        selectedDescriptionColor: "#e2e8f0",
+        style: { flexGrow: 1 }
+    };
 
-    useEffect(() => {
-        if (step === 'lut_manual') setInputVal(lut);
-        else if (step === 'output') setInputVal(defaultOutput);
-        else setInputVal('');
-    }, [step]);
-
-    switch (step) {
-        case 'info':
-            return (
-                <Box
-                    flexDirection="column"
-                    borderStyle="round"
-                    borderColor="cyan"
-                    paddingX={2}
-                    paddingY={1}
-                    marginX={1}
-                    marginY={1}
-                    gap={1}
-                >
-                    <Text bold color="cyan">  Правка последнего ролика</Text>
-                    <Box flexDirection="column">
-                        <Box><Text dimColor>  {'Дата рендера:'.padEnd(18)}</Text><Text>{renderedAt}</Text></Box>
-                        <Box><Text dimColor>  {'Сегментов:'.padEnd(18)}</Text><Text>{session.segments.length}</Text></Box>
-                        <Box><Text dimColor>  {'Длительность:'.padEnd(18)}</Text><Text>{session.totalDuration.toFixed(1)}s</Text></Box>
-                        <Box><Text dimColor>  {'Аудио:'.padEnd(18)}</Text><Text dimColor>{path.basename(session.audio)}</Text></Box>
-                    </Box>
-                    <Text dimColor>  Сегменты будут перерендерены с новыми настройками.</Text>
-                    <SelectInput
-                        items={[
-                            { label: '▶  Продолжить',   value: 'go'   },
-                            { label: '↩  Назад в меню', value: 'back' },
-                        ]}
-                        onSelect={(item: { value: string }) => {
-                            if (item.value === 'back') onBack();
-                            else setStep('lut_choice');
-                        }}
-                    />
-                </Box>
-            );
-
-        case 'lut_choice':
-            return (
-                <Box
-                    flexDirection="column"
-                    borderStyle="round"
-                    borderColor="cyan"
-                    paddingX={2}
-                    paddingY={1}
-                    marginX={1}
-                    marginY={1}
-                    gap={1}
-                >
-                    <Text bold color="cyan">  LUT цветокоррекция</Text>
-                    <SelectInput
-                        items={[
-                            ...(lut ? [{ label: `↩  ${path.basename(lut)}`, value: 'keep' }] : []),
-                            { label: '◈  Выбрать из папки luts/', value: 'browse' },
-                            { label: '✕  Без LUT',                value: 'none'   },
-                            { label: '✎  Ввести вручную',         value: 'manual' },
-                        ]}
-                        onSelect={(item: { value: string }) => {
-                            if (item.value === 'keep')        setStep('quality');
-                            else if (item.value === 'none')   { setLut(''); setStep('quality'); }
-                            else if (item.value === 'browse') setStep('lut_browse');
-                            else setStep('lut_manual');
-                        }}
-                    />
-                </Box>
-            );
-
-        case 'lut_browse':
-            return (
-                <FileBrowser
-                    folder={lutsDir}
-                    extensions={['.cube', '.3dl']}
-                    label="LUT файл"
-                    onSelect={(p) => { setLut(p); setStep('quality'); }}
-                    onManual={() => setStep('lut_manual')}
-                    onNone={() => { setLut(''); setStep('quality'); }}
-                />
-            );
-
-        case 'lut_manual':
-            return (
-                <Box
-                    flexDirection="column"
-                    borderStyle="round"
-                    borderColor="cyan"
-                    paddingX={2}
-                    paddingY={1}
-                    marginX={1}
-                    marginY={1}
-                >
-                    <Text bold color="cyan">  Путь к LUT (.cube)</Text>
-                    <Box><Text dimColor>  {'> '}</Text>
-                        <TextInput
-                            value={inputVal}
-                            placeholder={lut || './cinematic.cube'}
-                            onChange={setInputVal}
-                            onSubmit={(v) => { setLut(v.trim() || lut); setStep('quality'); }}
-                        />
-                    </Box>
-                </Box>
-            );
-
-        case 'quality':
-            return (
-                <Box
-                    flexDirection="column"
-                    borderStyle="round"
-                    borderColor="cyan"
-                    paddingX={2}
-                    paddingY={1}
-                    marginX={1}
-                    marginY={1}
-                    gap={1}
-                >
-                    <Text bold color="cyan">  Качество рендера</Text>
-                    <SelectInput
-                        items={QUALITY_ITEMS}
-                        initialIndex={QUALITY_ITEMS.findIndex(i => i.value === quality)}
-                        onSelect={(item: { value: string }) => { setQuality(item.value as QualityLevel); setStep('output'); }}
-                    />
-                </Box>
-            );
-
-        case 'output':
-            return (
-                <Box
-                    flexDirection="column"
-                    borderStyle="round"
-                    borderColor="cyan"
-                    paddingX={2}
-                    paddingY={1}
-                    marginX={1}
-                    marginY={1}
-                    gap={1}
-                >
-                    <Text bold color="cyan">  Выходной файл</Text>
-                    <Text dimColor>  Enter = новый файл с суффиксом _edit</Text>
-                    <Box><Text dimColor>  {'> '}</Text>
-                        <TextInput
-                            value={inputVal}
-                            placeholder={defaultOutput}
-                            onChange={setInputVal}
-                            onSubmit={(v) => { setOutput(v.trim() || defaultOutput); setStep('confirm'); }}
-                        />
-                    </Box>
-                </Box>
-            );
-
-        case 'confirm': {
-            const q = QUALITY_TEMPLATES[quality];
-            return (
-                <Box
-                    flexDirection="column"
-                    borderStyle="round"
-                    borderColor="green"
-                    paddingX={2}
-                    paddingY={1}
-                    marginX={1}
-                    marginY={1}
-                    gap={1}
-                >
-                    <Text bold color="green">  Параметры ре-рендера</Text>
-                    <Box flexDirection="column">
-                        <Box><Text dimColor>  {'LUT:'.padEnd(16)}</Text><Text>{lut ? path.basename(lut) : '—'}</Text></Box>
-                        <Box><Text dimColor>  {'Качество:'.padEnd(16)}</Text><Text>{q.label} — {q.description}</Text></Box>
-                        <Box><Text dimColor>  {'Выход:'.padEnd(16)}</Text><Text dimColor>{output}</Text></Box>
-                    </Box>
-                    <SelectInput
-                        items={[
-                            { label: '▶  Рендерить', value: 'go'   },
-                            { label: '↩  Назад',     value: 'back' },
-                        ]}
-                        onSelect={(item: { value: string }) => {
-                            if (item.value === 'back') onBack();
-                            else onDone({ lut, quality, output });
-                        }}
-                    />
-                </Box>
-            );
+    const renderInput = () => {
+        switch (step) {
+            case 'lut_choice':
+                const lutItems = [
+                    ...(lut ? [{ name: 'Keep current', description: path.basename(lut), value: 'keep' }] : []),
+                    { name: '◈ Browse luts/', description: 'Select file', value: 'browse' },
+                    { name: '✕ No LUT', description: 'Disable color grade', value: 'none'   },
+                    { name: '✎ Manual path', description: 'Path to .cube', value: 'manual' },
+                ];
+                return (
+                    <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.accent, marginBottom: 1 }}>LUT Grading:</text><select options={lutItems} onSelect={(idx) => { const val = lutItems[idx].value; if (val === 'keep') setStep('quality'); else if (val === 'none') { setLut(''); setStep('quality'); } else if (val === 'browse') setStep('lut_browse'); else setStep('lut_manual'); }} focused={true} {...selectStyles} /></box>
+                );
+            case 'lut_browse':
+                return (
+                    <FileBrowser folder={path.join(cwd, 'luts')} extensions={['.cube', '.3dl']} label="Select LUT file" onSelect={(p) => { setLut(p); setStep('quality'); }} onManual={() => setStep('lut_manual')} onNone={() => { setLut(''); setStep('quality'); }} />
+                );
+            case 'quality':
+                return (
+                    <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Render Quality:</text><select options={QUALITY_ITEMS} onSelect={(idx) => { setQuality(QUALITY_ITEMS[idx].value as QualityLevel); setStep('output'); }} focused={true} {...selectStyles} /></box>
+                );
+            case 'output':
+                return (
+                    <box style={{ flexDirection: 'column' }}><text style={{ color: THEME.accent, marginBottom: 1 }}>Output Path:</text><input value={inputVal || output} onInput={setInputVal} onSubmit={(v) => { setOutput(v || output); setStep('confirm'); }} focused={true} style={{ textColor: THEME.text }} /></box>
+                );
+            case 'confirm':
+                const confirmItems = [
+                    { name: '▶ Re-render', description: 'Start export', value: 'go'   },
+                    { name: '↩ Back', description: 'Main menu', value: 'back' },
+                ];
+                return (
+                    <box style={{ flexDirection: 'column', flexGrow: 1 }}><text style={{ color: THEME.success, bold: true, marginBottom: 1 }}>Ready to re-render!</text><select options={confirmItems} onSelect={(idx) => { if (confirmItems[idx].value === 'back') { onBack(); return; } onDone({ lut, quality, output }); }} focused={true} {...selectStyles} /></box>
+                );
+            default: return null;
         }
+    };
 
-        default: return null;
-    }
+    const maxValLen = width - 20;
+
+    return (
+        <box style={{ flexDirection: 'column', borderStyle: 'round', borderColor: THEME.accent, padding: 1, margin: 1, backgroundColor: THEME.background, width: '100%', height: '100%' }}><text style={{ bold: true, color: THEME.accent, marginBottom: 1 }}> ✎ EDIT SESSION </text><box style={{ flexDirection: 'column', marginBottom: 1, borderStyle: 'round', borderColor: THEME.border, padding: 1 }}><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Session: </text></box><text style={{ color: THEME.text }}>{session.renderedAt}</text></box><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>LUT: </text></box><text style={{ color: THEME.highlight }}>{truncate(lut ? path.basename(lut) : '—', maxValLen)}</text></box><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Quality: </text></box><text style={{ color: THEME.highlight }}>{quality}</text></box></box><box style={{ flexGrow: 1, marginTop: 1, borderStyle: 'round', borderColor: THEME.border, padding: 1 }}>{renderInput()}</box></box>
+    );
 };

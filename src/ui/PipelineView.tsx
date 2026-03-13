@@ -1,18 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Box, Text } from 'ink';
-
-// ─── Public callback interface ────────────────────────────────────────────────
+import { useTerminalDimensions, useKeyboard } from '@opentui/react';
+import { Config } from '../config';
+import { THEME } from './index';
 
 export interface PipelineCB {
     stage(n: number, total: number, label: string): void;
     info(msg: string): void;
+    log(msg: string): void;
     renderTick(segIdx: number, segPct: number, done: number, total: number): void;
     assemblyProgress(pct: number): void;
     done(outputPath: string): void;
     error(msg: string): void;
 }
-
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 type StageStatus = 'pending' | 'active' | 'done' | 'error';
 
@@ -20,282 +19,133 @@ interface StageState {
     label:    string;
     status:   StageStatus;
     detail:   string;
-    progress: number;   // -1 = none, 0-100 = show bar
-    counter:  string;   // e.g. "18/28"
+    progress: number;
+    counter:  string;
 }
 
-// Per-stage weight for overall progress (must sum to 100)
-const STAGE_WEIGHTS = [3, 1, 5, 14, 9, 55, 13];
+interface LogEntry {
+    msg: string;
+    startTime: number;
+    duration?: number;
+}
 
-// ─── Progress bar ─────────────────────────────────────────────────────────────
+const truncate = (str: string, maxLen: number) => {
+    if (str.length <= maxLen) return str;
+    return '...' + str.slice(-(maxLen - 3));
+};
 
-const Bar: React.FC<{ value: number; width?: number }> = ({ value, width = 28 }) => {
-    const v      = Math.max(0, Math.min(100, value));
-    const filled = Math.round(v / 100 * width);
+const formatDuration = (ms: number) => {
+    if (ms < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(1)}s`;
+};
+
+const ProgressBar: React.FC<{ value: number; width: number; color?: string }> = ({ value, width, color = THEME.accent }) => {
+    const v = Math.max(0, Math.min(100, value));
+    const barWidth = Math.max(2, width - 8); 
+    const filled = Math.round((v / 100) * barWidth);
     return (
-        <Text>
-            <Text color="cyan">{'█'.repeat(filled)}</Text>
-            <Text dimColor>{'░'.repeat(width - filled)}</Text>
-        </Text>
+        <box style={{ flexDirection: 'row' }}><text style={{ color }}>{'█'.repeat(filled)}</text><text style={{ color: THEME.border }}>{'░'.repeat(Math.max(0, barWidth - filled))}</text><text style={{ color: THEME.text }}> {v.toFixed(0).padStart(3)}%</text></box>
     );
 };
-
-// ─── Stage row ────────────────────────────────────────────────────────────────
-
-const ICONS: Record<StageStatus, string> = {
-    done:    '✓',
-    active:  '▸',
-    error:   '✗',
-    pending: '·',
-};
-const COLORS: Record<StageStatus, string | undefined> = {
-    done:    'green',
-    active:  'cyan',
-    error:   'red',
-    pending: undefined,
-};
-
-const StageRow: React.FC<{ stage: StageState }> = ({ stage: s }) => {
-    const color = COLORS[s.status];
-    return (
-        <Box>
-            <Text color={color as any}>{ICONS[s.status]}</Text>
-            <Text>{'  '}</Text>
-            <Text
-                bold={s.status === 'active'}
-                dimColor={s.status === 'pending'}
-                color={s.status === 'active' ? 'white' : color as any}
-            >
-                {s.label.padEnd(20)}
-            </Text>
-            {s.status === 'active' && s.progress >= 0 ? (
-                <Box>
-                    <Bar value={s.progress} width={18} />
-                    <Text dimColor>{'  '}{s.counter || `${s.progress.toFixed(0)}%`}</Text>
-                </Box>
-            ) : (
-                <Text dimColor color={s.status === 'done' ? 'green' as any : undefined}>
-                    {s.detail}
-                </Text>
-            )}
-        </Box>
-    );
-};
-
-// ─── Segment mini-grid (shown during rendering) ───────────────────────────────
-
-const SegmentGrid: React.FC<{ segs: Map<number, number>; total: number }> = ({ segs, total }) => {
-    // Show only active (in-progress) segments, up to 4
-    const active = [...segs.entries()]
-        .filter(([, pct]) => pct < 100 && pct > 0)
-        .sort(([a], [b]) => a - b)
-        .slice(0, 4);
-
-    if (active.length === 0) return null;
-
-    return (
-        <Box flexDirection="column" marginLeft={4} marginTop={0}>
-            {active.map(([idx, pct]) => (
-                <Box key={idx}>
-                    <Text dimColor>{`seg${String(idx + 1).padStart(3, '0')}  `}</Text>
-                    <Bar value={pct} width={16} />
-                    <Text dimColor>{'  '}{pct.toFixed(0).padStart(3)}%</Text>
-                </Box>
-            ))}
-        </Box>
-    );
-};
-
-// ─── Main component ───────────────────────────────────────────────────────────
 
 interface Props {
+    config:  Config;
     run:     (cb: PipelineCB) => Promise<void>;
     onDone:  () => void;
     onError: (msg: string) => void;
 }
 
-const STAGE_NAMES = [
-    'Анализ аудио',
-    'Сканирование',
-    'AI фильтрация',
-    'Индексация',
-    'Монтаж',
-    'Рендеринг',
-    'Сборка',
-];
+export const PipelineView: React.FC<Props> = ({ config, run, onDone, onError }) => {
+    const { width } = useTerminalDimensions();
+    const scrollRef = useRef<any>(null);
+    const [stages, setStages] = useState<StageState[]>([]);
+    const [overallPct, setOverallPct] = useState(0);
+    const [logs, setLogs] = useState<LogEntry[]>([]);
+    const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-export const PipelineView: React.FC<Props> = ({ run, onDone, onError }) => {
-    const total = STAGE_NAMES.length;
+    const currentStageRef = useRef(0);
+    const totalStagesRef = useRef(1);
 
-    const [stages, setStages] = useState<StageState[]>(
-        STAGE_NAMES.map(label => ({ label, status: 'pending', detail: '', progress: -1, counter: '' }))
-    );
-    const [segProgress, setSegProgress] = useState<Map<number, number>>(new Map());
-    const [overallPct,  setOverallPct]  = useState(0);
-    const [outputPath,  setOutputPath]  = useState('');
-    const [isDone,      setIsDone]      = useState(false);
-    const [errorMsg,    setErrorMsg]    = useState('');
-
-    const currentIdxRef = useRef(-1);
-
-    const recalcOverall = (idx: number, stagePct: number) => {
-        const base    = STAGE_WEIGHTS.slice(0, idx).reduce((a, b) => a + b, 0);
-        const contrib = (STAGE_WEIGHTS[idx] ?? 0) * stagePct / 100;
-        setOverallPct(Math.min(99, Math.round(base + contrib)));
+    const addLog = (msg: string) => {
+        const now = Date.now();
+        setLogs(prev => {
+            const newLogs = [...prev];
+            if (newLogs.length > 0) {
+                const last = newLogs[newLogs.length - 1]!;
+                if (!last.duration) last.duration = now - last.startTime;
+            }
+            return [...newLogs, { msg, startTime: now }];
+        });
     };
 
+    useKeyboard((key) => { if (errorMsg && (key.name === 'q' || key.name === 'return' || key.name === 'escape')) onError(errorMsg); });
+
+    useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = 99999; }, [logs]);
+
     useEffect(() => {
-        // Перехватываем console.log из внутренних модулей (indexer, director…)
-        const origLog  = console.log;
+        const origLog = console.log;
         const origWarn = console.warn;
-        const patchLog = (...args: unknown[]) => {
-            const msg = args.map(String).join(' ').replace(/^\s+/, '');
-            const idx = currentIdxRef.current;
-            if (idx >= 0) {
-                setStages(prev => prev.map((s, i) =>
-                    i === idx ? { ...s, detail: msg.slice(0, 60) } : s
-                ));
-            }
-        };
-        console.log  = patchLog;
-        console.warn = patchLog;
+        console.log = (...args: any[]) => { const m = args.map(String).join(' ').trim(); if (m) addLog(m); };
+        console.warn = (...args: any[]) => { const m = args.map(String).join(' ').trim(); if (m) addLog(`! ${m}`); };
 
         const cb: PipelineCB = {
-            stage(n, _total, label) {
-                const idx = n - 1;
-                currentIdxRef.current = idx;
-                setStages(prev => prev.map((s, i) => {
-                    if (i < idx) return { ...s, status: 'done' };
-                    if (i === idx) return { ...s, status: 'active', label };
-                    return s;
-                }));
-                recalcOverall(idx, 0);
-            },
-
-            info(msg) {
-                const idx = currentIdxRef.current;
-                if (idx < 0) return;
-                setStages(prev => prev.map((s, i) =>
-                    i === idx ? { ...s, detail: msg.slice(0, 60), progress: -1 } : s
-                ));
-            },
-
-            renderTick(segIdx, segPct, done, segTotal) {
-                setSegProgress(prev => {
-                    const next = new Map(prev);
-                    next.set(segIdx, segPct);
-                    return next;
+            stage(n, total, label) {
+                currentStageRef.current = n;
+                totalStagesRef.current = total;
+                setStages(prev => {
+                    let next = prev.length === 0 
+                        ? Array.from({ length: total }, (_, i) => ({ label: i === n - 1 ? label : `Стадия ${i + 1}`, status: 'pending' as StageStatus, detail: '', progress: -1, counter: '' }))
+                        : [...prev];
+                    return next.map((s, i) => {
+                        if (i < n - 1) return { ...s, status: 'done' as StageStatus };
+                        if (i === n - 1) return { ...s, status: 'active' as StageStatus, label };
+                        return s;
+                    });
                 });
-                const idx     = currentIdxRef.current;
-                const overall = Math.round([...Array.from(segProgress.values()), segPct]
-                    .reduce((s, v) => s + Math.min(100, v), 0) / Math.max(1, segTotal));
-                setStages(prev => prev.map((s, i) =>
-                    i === idx
-                        ? { ...s, progress: overall, counter: `${done}/${segTotal}` }
-                        : s
-                ));
-                recalcOverall(idx, overall);
+                addLog(`➜ Phase: ${label}`);
+                const basePct = Math.round(((n - 1) / total) * 100);
+                setOverallPct(basePct);
             },
-
+            info(msg) { setStages(prev => prev.map(s => s.status === 'active' ? { ...s, detail: msg } : s)); },
+            log(msg) { addLog(msg); },
+            renderTick(segIdx, segPct, done, segTotal) {
+                const stageProgress = Math.round((done / segTotal) * 100);
+                setStages(prev => prev.map(s => s.status === 'active' ? { ...s, progress: stageProgress, counter: `${done}/${segTotal}` } : s));
+                const n = currentStageRef.current;
+                const total = totalStagesRef.current;
+                const base = ((n - 1) / total) * 100;
+                const contribution = (1 / total) * stageProgress;
+                setOverallPct(Math.round(base + contribution));
+            },
             assemblyProgress(pct) {
-                const idx = currentIdxRef.current;
-                setStages(prev => prev.map((s, i) =>
-                    i === idx ? { ...s, progress: pct, counter: `${pct.toFixed(0)}%` } : s
-                ));
-                recalcOverall(idx, pct);
+                setStages(prev => prev.map(s => s.status === 'active' ? { ...s, progress: pct, counter: `${pct.toFixed(0)}%` } : s));
+                const n = currentStageRef.current;
+                const total = totalStagesRef.current;
+                const base = ((n - 1) / total) * 100;
+                const contribution = (1 / total) * pct;
+                setOverallPct(Math.round(base + contribution));
             },
-
             done(path) {
-                setStages(prev => prev.map(s => ({
-                    ...s, status: 'done' as StageStatus, progress: 100,
-                })));
+                setStages(prev => prev.map(s => ({ ...s, status: 'done', progress: 100 })));
                 setOverallPct(100);
-                setOutputPath(path);
-                setIsDone(true);
-                console.log  = origLog;
-                console.warn = origWarn;
-                setTimeout(() => onDone(), 800);
+                addLog(`✓ Success: ${path}`);
+                console.log = origLog; console.warn = origWarn;
+                setTimeout(onDone, 1500);
             },
-
             error(msg) {
-                const idx = currentIdxRef.current;
-                setStages(prev => prev.map((s, i) =>
-                    i === idx ? { ...s, status: 'error' as StageStatus, detail: msg.slice(0, 60) } : s
-                ));
+                setStages(prev => prev.map(s => s.status === 'active' ? { ...s, status: 'error', detail: msg } : s));
+                addLog(`✗ Error: ${msg}`);
                 setErrorMsg(msg);
-                console.log  = origLog;
-                console.warn = origWarn;
-                setTimeout(() => onError(msg), 400);
-            },
+            }
         };
-
-        run(cb).catch(err => {
-            cb.error(err instanceof Error ? err.message : String(err));
-        });
-
-        return () => {
-            console.log  = origLog;
-            console.warn = origWarn;
-        };
+        run(cb).catch(err => cb.error(err instanceof Error ? err.message : String(err)));
+        return () => { console.log = origLog; console.warn = origWarn; };
     }, []);
 
-    const currentIdx = currentIdxRef.current;
+    const leftColWidth = width - 37;
+    const maxValLen = leftColWidth - 16;
 
     return (
-        <Box
-            flexDirection="column"
-            borderStyle="round"
-            borderColor={errorMsg ? 'red' : isDone ? 'green' : 'cyan'}
-            paddingX={2}
-            paddingY={1}
-            marginX={1}
-            marginY={1}
-        >
-            {/* Header */}
-            <Box justifyContent="space-between" marginBottom={1}>
-                <Text bold color="cyan">  A U T O M O U N T E R</Text>
-                <Text dimColor>
-                    {currentIdx >= 0 ? `[${currentIdx + 1}/${total}]` : ''}{'  '}
-                </Text>
-            </Box>
-
-            {/* Stage list */}
-            {stages.map((s, i) => (
-                <Box key={i} flexDirection="column">
-                    <StageRow stage={s} />
-                    {/* Active segment grid during rendering */}
-                    {s.status === 'active' && segProgress.size > 0 && (
-                        <SegmentGrid segs={segProgress} total={stages[5]?.counter
-                            ? parseInt(stages[5].counter.split('/')[1] ?? '0') : 0} />
-                    )}
-                </Box>
-            ))}
-
-            {/* Overall progress */}
-            <Box marginTop={1}>
-                <Text dimColor>  Итого   </Text>
-                <Bar value={overallPct} width={32} />
-                <Text>{'  '}</Text>
-                <Text bold color={overallPct === 100 ? 'green' : 'white'}>
-                    {overallPct}%
-                </Text>
-            </Box>
-
-            {/* Done */}
-            {isDone && (
-                <Box marginTop={1}>
-                    <Text bold color="green">{'  '}✓ Готово → </Text>
-                    <Text dimColor>{outputPath}</Text>
-                </Box>
-            )}
-
-            {/* Error */}
-            {errorMsg && (
-                <Box marginTop={1}>
-                    <Text color="red">{'  '}✗ </Text>
-                    <Text color="red">{errorMsg}</Text>
-                </Box>
-            )}
-        </Box>
+        <box style={{ flexDirection: 'row', width: '100%', height: '100%', padding: 1, backgroundColor: THEME.background }}><box style={{ flexDirection: 'column', flexGrow: 1, marginRight: 1 }}><box style={{ height: 11, borderStyle: 'round', borderColor: THEME.border, padding: 1, marginBottom: 1, flexDirection: 'column' }}><text style={{ bold: true, color: THEME.accent }}> PROJECT CONFIG </text><box style={{ flexDirection: 'column', marginTop: 1 }}><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Input: </text></box><text style={{ color: THEME.highlight }}>{truncate(config.input, maxValLen)}</text></box><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Audio: </text></box><text style={{ color: THEME.highlight }}>{truncate(config.audio, maxValLen)}</text></box><box style={{ flexDirection: 'row' }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Prompt: </text></box><text style={{ color: THEME.highlight }}>{truncate(config.prompt, maxValLen)}</text></box><box style={{ flexDirection: 'row', marginTop: 1 }}><box style={{ width: 12 }}><text style={{ color: THEME.dim }}>Duration: </text></box><box style={{ width: 10 }}><text style={{ color: THEME.highlight }}>{config.duration}s</text></box><box style={{ width: 12, marginLeft: 2 }}><text style={{ color: THEME.dim }}>Quality: </text></box><text style={{ color: THEME.highlight }}>{config.quality}</text></box></box></box><box style={{ flexGrow: 1, borderStyle: 'round', borderColor: errorMsg ? THEME.error : THEME.accent, padding: 1, marginBottom: 1, flexDirection: 'column' }}><text style={{ bold: true, color: errorMsg ? THEME.error : THEME.text }}> {errorMsg ? 'FATAL ERROR (Press Q to exit)' : 'ACTIVITY LOG'} </text><box style={{ flexGrow: 1, marginTop: 1, flexDirection: 'column' }}><scrollbox ref={scrollRef} style={{ width: '100%', height: '100%' }} scrollY={true} stickyScroll={true} stickyStart="bottom">{logs.map((log, i) => (<box key={i} style={{ flexDirection: 'row', justifyContent: 'space-between', width: '100%' }}><text style={{ color: log.msg.startsWith('➜') ? THEME.accent : log.msg.startsWith('✓') ? THEME.success : log.msg.startsWith('✗') ? THEME.error : THEME.dim, flexGrow: 1 }}>{log.msg}</text>{log.duration ? <box style={{ marginRight: 1 }}><text style={{ color: THEME.border }}>{formatDuration(log.duration)}</text></box> : null}</box>))}</scrollbox></box></box><box style={{ height: 5, borderStyle: 'round', borderColor: THEME.border, padding: 1, flexDirection: 'column' }}><text style={{ bold: true, color: THEME.dim }}> OVERALL PROGRESS </text><box style={{ marginTop: 1, flexGrow: 1 }}><ProgressBar value={overallPct} width={leftColWidth - 4} /></box></box></box><box style={{ width: 35, borderStyle: 'round', borderColor: THEME.border, padding: 1, flexDirection: 'column' }}><text style={{ bold: true, color: THEME.dim }}> PIPELINE </text><box style={{ flexDirection: 'column', marginTop: 1, flexGrow: 1 }}>{stages.map((s, i) => (<box key={i} style={{ marginBottom: 1, flexDirection: 'column' }}><box style={{ flexDirection: 'row', justifyContent: 'space-between' }}><text style={{ color: s.status === 'done' ? THEME.success : s.status === 'active' ? THEME.accent : s.status === 'error' ? THEME.error : THEME.dim, bold: s.status === 'active' }}>{s.status === 'done' ? '✓' : s.status === 'active' ? '▸' : s.status === 'error' ? '✗' : '·'} {s.label}</text>{s.status === 'done' ? <text style={{ color: THEME.success }}>done</text> : null}</box>{s.detail ? <text style={{ color: THEME.border, marginLeft: 2, fontSize: '0.9em' }}>{truncate(s.detail, 30)}</text> : null}{s.status === 'active' && s.progress >= 0 ? <box style={{ marginLeft: 2, marginTop: 0 }}><ProgressBar value={s.progress} width={28} color={THEME.highlight} /></box> : null}</box>))}</box></box></box>
     );
 };

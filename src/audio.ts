@@ -51,18 +51,54 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
     const mt = new MusicTempo(audioData);
     const sampleRate = decoded.sampleRate;
 
-    // RMS windowing: 2-second windows with 50% overlap
+    // ─── 1. Sub-beats generation (1/2 beats) ─────────────────────────────────
+    // Полезно для очень динамичных сцен
+    const beats    = mt.beats;
+    const subBeats: number[] = [];
+    for (let i = 0; i < beats.length - 1; i++) {
+        const b1 = beats[i] ?? 0;
+        const b2 = beats[i + 1] ?? 0;
+        subBeats.push(b1);
+        subBeats.push(b1 + (b2 - b1) / 2);
+    }
+    if (beats.length > 0) subBeats.push(beats[beats.length - 1] ?? 0);
+
+    // ─── 2. Peak (Transient) detection ────────────────────────────────────────
+    // Ищем резкие скачки громкости (onset)
+    const winShort = Math.floor(0.05 * sampleRate); // 50ms window
+    const hopShort = Math.floor(winShort / 2);
+    const shortRms: number[] = [];
+    const shortTimes: number[] = [];
+
+    for (let o = 0; o + winShort <= audioData.length; o += hopShort) {
+        let sumSq = 0;
+        for (let i = o; i < o + winShort; i++) sumSq += (audioData[i] ?? 0) ** 2;
+        shortRms.push(Math.sqrt(sumSq / winShort));
+        shortTimes.push(o / sampleRate);
+    }
+
+    // Ищем локальные максимумы (пики) с порогом
+    const peaks: number[] = [];
+    const maxShortRms = Math.max(...shortRms, 1e-9);
+    for (let i = 1; i < shortRms.length - 1; i++) {
+        const prev = shortRms[i - 1] ?? 0;
+        const curr = shortRms[i]   ?? 0;
+        const next = shortRms[i + 1] ?? 0;
+        // Пик должен быть больше соседей и > 25% от максимума
+        if (curr > prev && curr > next && curr > maxShortRms * 0.25) {
+            peaks.push(shortTimes[i] ?? 0);
+        }
+    }
+
+    // ─── 3. Overall energy analysis ───────────────────────────────────────────
     const windowSamples = Math.floor(2.0 * sampleRate);
     const hopSamples    = Math.floor(windowSamples / 2);
-
     const rmsValues: number[]    = [];
     const windowTimes: number[]  = [];
 
     for (let offset = 0; offset + windowSamples <= audioData.length; offset += hopSamples) {
         let sumSq = 0;
-        for (let i = offset; i < offset + windowSamples; i++) {
-            sumSq += (audioData[i] ?? 0) ** 2;
-        }
+        for (let i = offset; i < offset + windowSamples; i++) sumSq += (audioData[i] ?? 0) ** 2;
         rmsValues.push(Math.sqrt(sumSq / windowSamples));
         windowTimes.push(offset / sampleRate);
     }
@@ -71,7 +107,6 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
     const normalizedRms = rmsValues.map(v => v / maxRms);
     const overallEnergy = normalizedRms.reduce((a, b) => a + b, 0) / (normalizedRms.length || 1);
 
-    // Drop detection: energy spike (> 0.75) following low-energy window (< 0.4)
     const drops: number[] = [];
     for (let i = 1; i < normalizedRms.length; i++) {
         if ((normalizedRms[i] ?? 0) > 0.75 && (normalizedRms[i - 1] ?? 1) < 0.4) {
@@ -92,6 +127,8 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
     return {
         tempo: mt.tempo,
         beats: mt.beats,
+        subBeats,
+        peaks,
         style: overallStyle,
         energy: overallEnergy,
         drops,
