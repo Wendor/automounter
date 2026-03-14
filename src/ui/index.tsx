@@ -12,7 +12,7 @@ export type { PipelineCB };
 
 export type AppResult =
   | { mode: "create"; config: Config }
-  | { mode: "edit"; lut: string; quality: QualityLevel; output: string }
+  | { mode: "edit"; lut: string; quality: QualityLevel; output: string; colorRef?: string }
   | { mode: "index"; input: string; model: string; reindex: boolean };
 
 export const THEME = {
@@ -162,6 +162,7 @@ const App = ({ saved, session, cwd, onDone }: AppProps) => {
           currentLut={saved.lut ?? ""}
           currentQuality={saved.quality ?? "medium"}
           currentOutput={saved.output ?? ""}
+          currentColorRef={saved.colorRef ?? ""}
           cwd={cwd}
           onDone={(r) => onDone({ mode: "edit", ...r })}
           onBack={() => setMode("menu")}

@@ -25,6 +25,7 @@ type Step =
   | "lut_manual"
   | "color_ref_choice"
   | "color_ref_youtube"
+  | "color_ref_images"
   | "color_ref_local"
   | "quality"
   | "confirm";
@@ -97,7 +98,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
       ? "audio_choice"
       : step === "lut_browse" || step === "lut_manual"
         ? "lut_choice"
-        : step === "color_ref_youtube" || step === "color_ref_local"
+        : step === "color_ref_youtube" || step === "color_ref_local" || step === "color_ref_images"
           ? "color_ref_choice"
           : step,
   );
@@ -111,6 +112,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
       audio_manual: () => form.audio,
       lut_manual: () => form.lut,
       color_ref_youtube: () => form.colorRef,
+      color_ref_images: () => form.colorRef,
       prompt: () => form.prompt,
       duration: () => form.duration,
     };
@@ -376,13 +378,18 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             value: "none",
           },
           {
+            name: "◧ Папка с изображениями",
+            description: "jpg/png/webp референсные кадры",
+            value: "images",
+          },
+          {
             name: "▶ YouTube URL",
             description: "Ввести ссылку на видео",
             value: "youtube",
           },
           {
-            name: "✎ Локальный файл",
-            description: "Выбрать видео на диске",
+            name: "✎ Локальный видеофайл",
+            description: "mp4/mov на диске",
             value: "local",
           },
         ];
@@ -400,10 +407,35 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
                   set("colorRef", "");
                   setStep("quality");
                 } else if (val === "youtube") setStep("color_ref_youtube");
+                else if (val === "images") setStep("color_ref_images");
                 else setStep("color_ref_local");
               }}
               focused={true}
               {...selectStyles}
+            />
+          </box>
+        );
+      case "color_ref_images":
+        return (
+          <box style={{ flexDirection: "column" }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              Путь к папке с изображениями:
+            </text>
+            <input
+              value={inputVal}
+              placeholder={form.colorRef || "./reference"}
+              onInput={setInputVal}
+              onSubmit={(v: any) => {
+                const val = String(v).trim() || form.colorRef;
+                if (!val) {
+                  setError("Укажи папку");
+                  return;
+                }
+                set("colorRef", val);
+                setStep("quality");
+              }}
+              focused={true}
+              style={{ textColor: THEME.text }}
             />
           </box>
         );
@@ -456,6 +488,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             </text>
             <select
               options={QUALITY_ITEMS}
+              selectedIndex={Math.max(0, QUALITY_ITEMS.findIndex((q) => q.value === form.quality))}
               onSelect={(idx) => {
                 set("quality", QUALITY_ITEMS[idx].value);
                 setStep("confirm");

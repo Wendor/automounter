@@ -88,6 +88,7 @@ export interface VideoSegment {
   sourceFps: number; // native fps of source clip
   transition: "dissolve" | "hard"; // transition INTO this segment from previous
   transitionDuration: number; // seconds (0 for hard cut)
+  eqFilter?: string; // per-segment color correction (eq=...)
 }
 
 export interface SliceResult {

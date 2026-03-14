@@ -11,9 +11,12 @@ import { indexMediaFolder } from "./src/indexer";
 import { createDirectorPlan, preFilterFiles } from "./src/director";
 import { renderSegments, concatenateAndAddMusic } from "./src/render";
 import {
-  analyzeColorReference,
+  buildColorProfile,
+  analyzeSegmentColors,
+  smoothLUTs,
+  lutsToFilter,
   downloadYouTubeVideo,
-  eqFilterString,
+  SegmentLUTs,
 } from "./src/color_grading";
 import { showInkUI, showPipelineUI, PipelineCB } from "./src/ui/index";
 import {
@@ -255,32 +258,38 @@ async function runMainPipeline(
       `${plan.segments.length} scenes · ${plan.totalDuration.toFixed(1)}s`,
     );
 
-    let eqFilter: string | undefined;
     if (hasColorRef) {
       cb.stage(6, stageNames, 5);
-      let refVideoPath = config.colorRef!;
-      if (refVideoPath.startsWith("http://") || refVideoPath.startsWith("https://")) {
+      let refPath = config.colorRef!;
+      if (refPath.startsWith("http://") || refPath.startsWith("https://")) {
         cb.log("Downloading YouTube reference...");
         const ytPath = path.join(TEMP_DIR, "color_reference.mp4");
         fs.mkdirSync(TEMP_DIR, { recursive: true });
-        await downloadYouTubeVideo(refVideoPath, ytPath);
-        refVideoPath = ytPath;
+        await downloadYouTubeVideo(refPath, ytPath);
+        refPath = ytPath;
         cb.info("Download complete");
       }
-      const uniqueSources = [
-        ...new Set(plan.segments.map((s) => s.sourceFile)),
-      ];
-      cb.log(`Analyzing colors (${uniqueSources.length} source clip(s))...`);
-      const colorSettings = await analyzeColorReference(
-        refVideoPath,
-        uniqueSources,
-        config.lut,
-        TEMP_DIR,
-        (msg) => cb.log(msg),
-      );
-      if (colorSettings) {
-        eqFilter = eqFilterString(colorSettings);
-        cb.info(`Applied: ${eqFilter}`);
+      const refProfile = await buildColorProfile(refPath, TEMP_DIR, (msg) => cb.log(msg));
+      if (refProfile) {
+        cb.log(`Analyzing color per segment (${plan.segments.length} clips)...`);
+        let done = 0;
+        const rawLuts: (SegmentLUTs | null)[] = [];
+        for (const seg of plan.segments) {
+          rawLuts.push(await analyzeSegmentColors(
+            seg.sourceFile,
+            seg.startTime,
+            seg.rawDuration,
+            refProfile,
+            config.lut,
+            TEMP_DIR,
+          ));
+          cb.renderTick(0, 100, ++done, plan.segments.length);
+        }
+        const smoothed = smoothLUTs(rawLuts);
+        for (let i = 0; i < plan.segments.length; i++) {
+          if (smoothed[i]) plan.segments[i]!.eqFilter = lutsToFilter(smoothed[i]!);
+        }
+        cb.info(`Color correction applied to ${plan.segments.length} segments`);
       }
     }
 
@@ -303,7 +312,6 @@ async function runMainPipeline(
         ).length;
         cb.renderTick(segIdx, pct, done, segTotal);
       },
-      eqFilter,
     );
 
     cb.stage(hasColorRef ? 8 : 7, stageNames, hasColorRef ? 7 : 6);
@@ -354,6 +362,7 @@ async function runEditPipeline(
   lut: string,
   qualityLevel: string,
   output: string,
+  colorRef: string | undefined,
   cb: PipelineCB,
 ): Promise<void> {
   const runId = Date.now().toString(36);
@@ -361,6 +370,11 @@ async function runEditPipeline(
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 
   const cleanup = () => fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+
+  const hasColorRef = !!colorRef;
+  const stageNames = hasColorRef
+    ? ["Цвет. референс", "Рендеринг", "Сборка"]
+    : pipelineStageNames.edit;
 
   try {
     const filePaths = [...new Set(session.segments.map((s) => s.sourceFile))];
@@ -371,13 +385,48 @@ async function runEditPipeline(
 
     const segments = session.segments.map((seg, i) => ({
       ...seg,
+      eqFilter: undefined as string | undefined,
       outputFile: path.join(
         TEMP_DIR,
         `segment_${i.toString().padStart(3, "0")}.mp4`,
       ),
     }));
 
-    cb.stage(1, pipelineStageNames.edit, 0);
+    if (hasColorRef) {
+      cb.stage(1, stageNames, 0);
+      let refPath = colorRef!;
+      if (refPath.startsWith("http://") || refPath.startsWith("https://")) {
+        cb.log("Downloading YouTube reference...");
+        const ytPath = path.join(TEMP_DIR, "color_reference.mp4");
+        await downloadYouTubeVideo(refPath, ytPath);
+        refPath = ytPath;
+        cb.info("Download complete");
+      }
+      const refProfile = await buildColorProfile(refPath, TEMP_DIR, (msg) => cb.log(msg));
+      if (refProfile) {
+        cb.log(`Analyzing color per segment (${segments.length} clips)...`);
+        let done = 0;
+        const rawLuts: (SegmentLUTs | null)[] = [];
+        for (const seg of segments) {
+          rawLuts.push(await analyzeSegmentColors(
+            seg.sourceFile,
+            seg.startTime,
+            seg.rawDuration,
+            refProfile,
+            lut,
+            TEMP_DIR,
+          ));
+          cb.renderTick(0, 100, ++done, segments.length);
+        }
+        const smoothed = smoothLUTs(rawLuts);
+        for (let i = 0; i < segments.length; i++) {
+          if (smoothed[i]) segments[i]!.eqFilter = lutsToFilter(smoothed[i]!);
+        }
+        cb.info(`Color correction applied to ${segments.length} segments`);
+      }
+    }
+
+    cb.stage(hasColorRef ? 2 : 1, stageNames, hasColorRef ? 1 : 0);
     const segProgressMap = new Map<number, number>();
     const segTotal = segments.length;
 
@@ -397,7 +446,7 @@ async function runEditPipeline(
       },
     );
 
-    cb.stage(2, pipelineStageNames.edit, 1);
+    cb.stage(hasColorRef ? 3 : 2, stageNames, hasColorRef ? 2 : 1);
     const segmentConcatInfo = segments.map((seg, i) => ({
       file: sliceResult.files[i] ?? seg.outputFile,
       targetDuration: seg.targetDuration,
@@ -516,14 +565,17 @@ async function main(): Promise<void> {
       console.error("[Fatal] Нет сохранённой сессии.\n");
       process.exit(1);
     }
-    const currentConfig = {
-      ...loadSavedConfig(),
+    const savedForEdit = loadSavedConfig();
+    const updatedConfig = {
+      ...savedForEdit,
       lut: result.lut,
       quality: result.quality,
       output: result.output,
+      colorRef: result.colorRef,
     } as any;
-    await showPipelineUI(currentConfig, (cb) =>
-      runEditPipeline(session, result.lut, result.quality, result.output, cb),
+    saveConfig(updatedConfig);
+    await showPipelineUI(updatedConfig, (cb) =>
+      runEditPipeline(session, result.lut, result.quality, result.output, result.colorRef, cb),
     );
   } else if (result.mode === "index") {
     await showPipelineUI(

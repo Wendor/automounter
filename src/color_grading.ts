@@ -9,91 +9,38 @@ const execFileAsync = promisify(execFile);
 const FFMPEG = ffmpegInstaller.path;
 const FFPROBE = ffprobeInstaller.path;
 
-const EVAL_RES = 64;
-const MAX_SOURCE_VIDEOS = 8;
-
+// Разрешение кадра для анализа: 256×256 даёт 65536 пикселей — достаточно для
+// точных гистограмм, не слишком дорого по времени.
+const EVAL_RES = 256;
+const IMAGE_EXTS = /\.(jpe?g|png|webp|tiff?)$/i;
 const hwaccelArgs: string[] =
   process.platform === "darwin" ? ["-hwaccel", "videotoolbox"] : [];
 
 // ─── Публичные типы ───────────────────────────────────────────────────────────
 
-export interface FFmpegColorSettings {
-  contrast: number;
-  brightness: number;
-  saturation: number;
-  gamma: number;
+/**
+ * Цветовой профиль референса — кумулятивные функции распределения (CDF)
+ * по каждому каналу RGB. Строится один раз из всех референсных изображений,
+ * затем используется для согласования каждого сегмента.
+ */
+export interface ColorProfile {
+  rCDF: Float32Array; // [256] — кумулятивное распределение красного канала
+  gCDF: Float32Array; // [256] — зелёного
+  bCDF: Float32Array; // [256] — синего
+  pixelCount: number; // суммарное количество пикселей (для диагностики)
 }
 
-export function eqFilterString(s: FFmpegColorSettings): string {
-  return `eq=contrast=${s.contrast.toFixed(3)}:brightness=${s.brightness.toFixed(3)}:saturation=${s.saturation.toFixed(3)}:gamma=${s.gamma.toFixed(3)}`;
+/**
+ * Промежуточный результат анализа одного сегмента — сырые LUT-таблицы.
+ * Хранится до сглаживания, чтобы можно было блендить с соседями.
+ */
+export interface SegmentLUTs {
+  r: Uint8Array; // [256] — таблица замены красного канала
+  g: Uint8Array; // [256] — зелёного
+  b: Uint8Array; // [256] — синего
 }
 
-// ─── Математическое ядро ─────────────────────────────────────────────────────
-
-function applyEq(
-  r: number,
-  g: number,
-  b: number,
-  s: FFmpegColorSettings,
-): [number, number, number] {
-  let rn = r / 255,
-    gn = g / 255,
-    bn = b / 255;
-  rn = (rn - 0.5) * s.contrast + 0.5 + s.brightness;
-  gn = (gn - 0.5) * s.contrast + 0.5 + s.brightness;
-  bn = (bn - 0.5) * s.contrast + 0.5 + s.brightness;
-  rn = rn > 0 ? rn ** (1 / s.gamma) : 0;
-  gn = gn > 0 ? gn ** (1 / s.gamma) : 0;
-  bn = bn > 0 ? bn ** (1 / s.gamma) : 0;
-  const luma = 0.299 * rn + 0.587 * gn + 0.114 * bn;
-  rn = luma + s.saturation * (rn - luma);
-  gn = luma + s.saturation * (gn - luma);
-  bn = luma + s.saturation * (bn - luma);
-  return [
-    Math.max(0, Math.min(255, Math.round(rn * 255))),
-    Math.max(0, Math.min(255, Math.round(gn * 255))),
-    Math.max(0, Math.min(255, Math.round(bn * 255))),
-  ];
-}
-
-function rgbToLab(r: number, g: number, b: number): [number, number, number] {
-  let rn = r / 255,
-    gn = g / 255,
-    bn = b / 255;
-  rn = rn > 0.04045 ? ((rn + 0.055) / 1.055) ** 2.4 : rn / 12.92;
-  gn = gn > 0.04045 ? ((gn + 0.055) / 1.055) ** 2.4 : gn / 12.92;
-  bn = bn > 0.04045 ? ((bn + 0.055) / 1.055) ** 2.4 : bn / 12.92;
-  const x = (rn * 0.4124 + gn * 0.3576 + bn * 0.1805) / 0.95047;
-  const y = rn * 0.2126 + gn * 0.7152 + bn * 0.0722;
-  const z = (rn * 0.0193 + gn * 0.1192 + bn * 0.9505) / 1.08883;
-  const f = (v: number) =>
-    v > 0.008856 ? v ** (1 / 3) : 7.787 * v + 16 / 116;
-  return [116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))];
-}
-
-function deltaE(
-  lab1: [number, number, number],
-  lab2: [number, number, number],
-  lumaOnly: boolean,
-): number {
-  const dL = lab1[0] - lab2[0];
-  if (lumaOnly) return Math.abs(dL);
-  return Math.sqrt(
-    dL * dL + (lab1[1] - lab2[1]) ** 2 + (lab1[2] - lab2[2]) ** 2,
-  );
-}
-
-// Средний L* канал буфера (0–100)
-function meanL(buf: Buffer): number {
-  const pixels = Math.floor(buf.length / 3);
-  let sum = 0;
-  for (let i = 0; i < pixels * 3; i += 3) {
-    sum += rgbToLab(buf[i]!, buf[i + 1]!, buf[i + 2]!)[0];
-  }
-  return sum / pixels;
-}
-
-// ─── Работа с буферами ────────────────────────────────────────────────────────
+// ─── Работа с пикселями ───────────────────────────────────────────────────────
 
 function extractRgbBuffer(imagePath: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -117,8 +64,13 @@ function extractRgbBuffer(imagePath: string): Promise<Buffer> {
     proc.on("close", () => {
       const buf = Buffer.concat(stdout);
       if (buf.length === 0) {
-        const errMsg = stderr.join("").split("\n").filter(Boolean).at(-1) ?? "unknown";
-        reject(new Error(`Empty rawvideo output for ${path.basename(imagePath)}: ${errMsg}`));
+        const errMsg =
+          stderr.join("").split("\n").filter(Boolean).at(-1) ?? "unknown";
+        reject(
+          new Error(
+            `Empty rawvideo for ${path.basename(imagePath)}: ${errMsg}`,
+          ),
+        );
       } else {
         resolve(buf);
       }
@@ -127,102 +79,167 @@ function extractRgbBuffer(imagePath: string): Promise<Buffer> {
   });
 }
 
-function averageBuffers(buffers: Buffer[]): Buffer {
-  const valid = buffers.filter((b) => b.length > 0 && b.length % 3 === 0);
-  if (valid.length === 0) throw new Error("No valid RGB buffers");
-  const len = Math.min(...valid.map((b) => b.length));
-  const out = Buffer.alloc(len);
-  for (let i = 0; i < len; i++) {
+// ─── Гистограммный анализ ─────────────────────────────────────────────────────
+
+/**
+ * Строит CDF по трём каналам из массива RGB-буферов.
+ * Все буферы объединяются — это даёт нам глобальное распределение,
+ * а не среднее от отдельных кадров (избегаем потери информации о разбросе).
+ */
+function buildCDFs(buffers: Buffer[]): ColorProfile {
+  const rHist = new Float32Array(256);
+  const gHist = new Float32Array(256);
+  const bHist = new Float32Array(256);
+  let totalPixels = 0;
+
+  for (const buf of buffers) {
+    const pixels = Math.floor(buf.length / 3);
+    totalPixels += pixels;
+    for (let i = 0; i < pixels * 3; i += 3) {
+      rHist[buf[i]!]++;
+      gHist[buf[i + 1]!]++;
+      bHist[buf[i + 2]!]++;
+    }
+  }
+
+  const toCDF = (hist: Float32Array): Float32Array => {
+    const cdf = new Float32Array(256);
     let sum = 0;
-    for (const b of valid) sum += b[i]!;
-    out[i] = Math.round(sum / valid.length);
-  }
-  return out;
-}
-
-// ─── Оптимизатор (Simulated Annealing) ───────────────────────────────────────
-
-type Bounds = { min: number; max: number };
-
-const PARAM_BOUNDS: Record<keyof FFmpegColorSettings, Bounds> = {
-  contrast: { min: 0.8, max: 1.2 },
-  brightness: { min: -0.15, max: 0.15 },
-  saturation: { min: 0.5, max: 1.5 },
-  gamma: { min: 0.8, max: 1.2 },
-};
-
-function evaluateDelta(
-  ref: Buffer,
-  src: Buffer,
-  s: FFmpegColorSettings,
-  lumaOnly: boolean,
-): number {
-  let total = 0;
-  const pixels = Math.floor(ref.length / 3);
-  for (let i = 0; i < pixels * 3; i += 3) {
-    const [ar, ag, ab] = applyEq(src[i]!, src[i + 1]!, src[i + 2]!, s);
-    total += deltaE(
-      rgbToLab(ref[i]!, ref[i + 1]!, ref[i + 2]!),
-      rgbToLab(ar, ag, ab),
-      lumaOnly,
-    );
-  }
-  return total / pixels;
-}
-
-function optimizeSettings(
-  refBuf: Buffer,
-  srcBuf: Buffer,
-): FFmpegColorSettings {
-  const DEF_BRIGHTNESS = Math.max(
-    -0.15,
-    Math.min(0.15, (meanL(refBuf) - meanL(srcBuf)) / 100),
-  );
-  const DEFAULT: FFmpegColorSettings = {
-    contrast: 1.0,
-    brightness: DEF_BRIGHTNESS,
-    saturation: 1.0,
-    gamma: 1.0,
+    for (let v = 0; v < 256; v++) {
+      sum += hist[v]! / totalPixels;
+      cdf[v] = sum;
+    }
+    return cdf;
   };
 
-  // Если сцены слишком разные по цвету (deltaE > 35) — только яркость/контраст
-  const lumaOnly = evaluateDelta(refBuf, srcBuf, DEFAULT, false) > 35;
-  const allKeys = Object.keys(DEFAULT) as (keyof FFmpegColorSettings)[];
-  const keys = lumaOnly ? allKeys.filter((k) => k !== "saturation") : allKeys;
-
-  let cur = { ...DEFAULT };
-  let best = { ...DEFAULT };
-  let curCost = evaluateDelta(refBuf, srcBuf, cur, lumaOnly);
-  let bestCost = curCost;
-  let temp = 100;
-
-  for (let i = 0; i < 2000; i++) {
-    const candidate = { ...cur };
-    const key = keys[Math.floor(Math.random() * keys.length)]!;
-    const b = PARAM_BOUNDS[key];
-    candidate[key] = Math.max(
-      b.min,
-      Math.min(
-        b.max,
-        candidate[key] +
-          (Math.random() - 0.5) * (b.max - b.min) * (temp / 100),
-      ),
-    );
-    const cost = evaluateDelta(refBuf, srcBuf, candidate, lumaOnly);
-    if (cost < curCost || Math.random() < Math.exp(-(cost - curCost) / temp)) {
-      cur = candidate;
-      curCost = cost;
-      if (curCost < bestCost) {
-        best = { ...cur };
-        bestCost = curCost;
-      }
-    }
-    temp *= 0.99;
-  }
-  return best;
+  return {
+    rCDF: toCDF(rHist),
+    gCDF: toCDF(gHist),
+    bCDF: toCDF(bHist),
+    pixelCount: totalPixels,
+  };
 }
 
-// ─── Видео-утилиты ────────────────────────────────────────────────────────────
+/**
+ * Histogram matching: для каждого входного значения [0..255] находим
+ * выходное значение с ближайшим CDF через бинарный поиск.
+ * Это аналитическое (детерминированное) решение, не требует оптимизации.
+ */
+function buildMatchLUT(srcCDF: Float32Array, refCDF: Float32Array): Uint8Array {
+  const lut = new Uint8Array(256);
+  for (let sv = 0; sv < 256; sv++) {
+    const target = srcCDF[sv]!;
+    let lo = 0,
+      hi = 255;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (refCDF[mid]! < target) lo = mid + 1;
+      else hi = mid;
+    }
+    lut[sv] = lo;
+  }
+  return lut;
+}
+
+// Точки семплирования кривой для curves-фильтра FFmpeg.
+// 9 точек достаточно для точного представления гистограммного LUT.
+const CURVE_SAMPLES = [0, 32, 64, 96, 128, 160, 192, 224, 255];
+
+function lutToCurvePoints(lut: Uint8Array): string {
+  return CURVE_SAMPLES.map(
+    (v) => `${(v / 255).toFixed(4)}/${(lut[v]! / 255).toFixed(4)}`,
+  ).join(" ");
+}
+
+// Какую долю коррекции оставляем per-channel (хроматическая).
+// Остаток (1 - CHROMA_WEIGHT) — это яркостная коррекция, одинаковая для всех
+// каналов, которая сохраняет нейтральные цвета (серый остаётся серым).
+// 0.0 = только яркость, нет сдвига оттенка; 1.0 = полная per-channel коррекция.
+const CHROMA_WEIGHT = 0.4;
+
+/**
+ * Строит SegmentLUTs из профилей источника и референса.
+ *
+ * Алгоритм:
+ * 1. Per-channel гистограммное согласование (R, G, B отдельно).
+ * 2. Яркостная LUT = перцептивно взвешенное среднее каналов (0.299R+0.587G+0.114B).
+ *    Эта LUT одинакова для всех трёх каналов → нейтрали (серые) остаются серыми.
+ * 3. Финальная LUT каждого канала = (1-CHROMA_WEIGHT) яркостная + CHROMA_WEIGHT per-channel.
+ *    Это убирает жёлтый/зелёный cast при сохранении лёгкой цветовой коррекции.
+ */
+function buildSegmentLUTs(srcBufs: Buffer[], refProfile: ColorProfile): SegmentLUTs {
+  const src = buildCDFs(srcBufs);
+  const rLUT = buildMatchLUT(src.rCDF, refProfile.rCDF);
+  const gLUT = buildMatchLUT(src.gCDF, refProfile.gCDF);
+  const bLUT = buildMatchLUT(src.bCDF, refProfile.bCDF);
+
+  // Яркостная LUT: перцептивные веса ITU-R BT.601
+  const lumaLUT = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    lumaLUT[i] = Math.round(0.299 * rLUT[i]! + 0.587 * gLUT[i]! + 0.114 * bLUT[i]!);
+  }
+
+  // Смешиваем яркостную и per-channel LUT
+  const blend = (chLUT: Uint8Array): Uint8Array => {
+    const out = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) {
+      out[i] = Math.round(
+        (1 - CHROMA_WEIGHT) * lumaLUT[i]! + CHROMA_WEIGHT * chLUT[i]!,
+      );
+    }
+    return out;
+  };
+
+  return { r: blend(rLUT), g: blend(gLUT), b: blend(bLUT) };
+}
+
+/**
+ * Конвертирует SegmentLUTs в строку FFmpeg-фильтра `curves`.
+ * Вызывается после сглаживания.
+ */
+export function lutsToFilter(luts: SegmentLUTs): string {
+  return `curves=r='${lutToCurvePoints(luts.r)}':g='${lutToCurvePoints(luts.g)}':b='${lutToCurvePoints(luts.b)}'`;
+}
+
+/**
+ * Сглаживает LUT-таблицы между соседними сегментами, чтобы цветокор
+ * не скакал резко на стыках клипов.
+ *
+ * Каждый сегмент получает взвешенное среднее своей LUT и LUT соседей:
+ *   weights = [0.2, 0.6, 0.2] для сегментов [i-1, i, i+1]
+ *
+ * Null-сегменты (анализ не удался) пропускаются — их вес перераспределяется
+ * на оставшихся соседей.
+ */
+export function smoothLUTs(luts: (SegmentLUTs | null)[]): (SegmentLUTs | null)[] {
+  const n = luts.length;
+  return luts.map((cur, i) => {
+    if (!cur) return null;
+
+    // Собираем доступных соседей с весами [prev=0.2, cur=0.6, next=0.2]
+    const NEIGHBOR_WEIGHT = 0.2;
+    const entries: { lut: SegmentLUTs; w: number }[] = [{ lut: cur, w: 0.6 }];
+    if (i > 0 && luts[i - 1]) entries.push({ lut: luts[i - 1]!, w: NEIGHBOR_WEIGHT });
+    if (i < n - 1 && luts[i + 1]) entries.push({ lut: luts[i + 1]!, w: NEIGHBOR_WEIGHT });
+
+    // Нормализуем веса (на случай отсутствующих соседей)
+    const totalW = entries.reduce((s, e) => s + e.w, 0);
+
+    const blendChannel = (ch: keyof SegmentLUTs): Uint8Array => {
+      const out = new Uint8Array(256);
+      for (let v = 0; v < 256; v++) {
+        let sum = 0;
+        for (const { lut, w } of entries) sum += (w / totalW) * lut[ch][v]!;
+        out[v] = Math.round(sum);
+      }
+      return out;
+    };
+
+    return { r: blendChannel("r"), g: blendChannel("g"), b: blendChannel("b") };
+  });
+}
+
+// ─── Видео и файловые утилиты ────────────────────────────────────────────────
 
 async function getVideoDuration(videoPath: string): Promise<number> {
   const { stdout } = await execFileAsync(FFPROBE, [
@@ -239,16 +256,15 @@ async function getVideoDuration(videoPath: string): Promise<number> {
   return d;
 }
 
-async function extractFrame(
+async function extractVideoFrame(
   videoPath: string,
-  fraction: number,
+  timeSec: number,
   outputPath: string,
 ): Promise<void> {
-  const duration = await getVideoDuration(videoPath);
   await execFileAsync(FFMPEG, [
     ...hwaccelArgs,
     "-ss",
-    String(duration * fraction),
+    String(timeSec),
     "-i",
     videoPath,
     "-frames:v",
@@ -307,81 +323,126 @@ export async function downloadYouTubeVideo(
 }
 
 /**
- * Анализирует цветовой референс и возвращает параметры eq-фильтра FFmpeg.
+ * Строит цветовой профиль (CDF по 3 каналам) из референса.
+ * refPath — папка с изображениями ИЛИ путь к видеофайлу.
  *
- * sourceVideoPaths — уникальные исходники из плана монтажа (все сцены).
- * Из каждого берётся 1 кадр (50%), усредняются — это «средний цвет всего ролика».
- * Оптимизатор ищет коррекцию от этой базы к палитре референса.
+ * Ключевое отличие от старого подхода: пиксели НЕ усредняются —
+ * все пиксели объединяются для точного распределения.
  */
-export async function analyzeColorReference(
-  refVideoPath: string,
-  sourceVideoPaths: string[],
-  lutFile: string,
+export async function buildColorProfile(
+  refPath: string,
   tempDir: string,
   log: (msg: string) => void = console.log,
-): Promise<FFmpegColorSettings | null> {
+): Promise<ColorProfile | null> {
   const id = Date.now().toString(36);
   const tempFiles: string[] = [];
 
   try {
-    // 5 кадров из референса: лучшее покрытие его цветового диапазона
-    const refFractions = [0.1, 0.25, 0.5, 0.75, 0.9];
-    log(`Extracting ${refFractions.length} reference frames...`);
-    const refFrames = await Promise.all(
-      refFractions.map(async (frac, i) => {
-        const p = path.join(tempDir, `cr_ref_${id}_${i}.jpg`);
-        tempFiles.push(p);
-        await extractFrame(refVideoPath, frac, p);
-        return p;
-      }),
-    );
+    const isDir =
+      fs.existsSync(refPath) && fs.statSync(refPath).isDirectory();
 
-    // 1 кадр с каждого исходника (до MAX_SOURCE_VIDEOS)
-    const sources = sourceVideoPaths.slice(0, MAX_SOURCE_VIDEOS);
-    log(`Sampling ${sources.length} source clip(s)...`);
-    const srcFrames = await Promise.all(
-      sources.map(async (videoPath, i) => {
-        const p = path.join(tempDir, `cr_src_${id}_${i}.jpg`);
-        tempFiles.push(p);
-        await extractFrame(videoPath, 0.5, p);
-        return p;
-      }),
-    );
+    let imagePaths: string[];
 
-    // Применяем LUT к исходникам перед сравнением (если задан)
-    let analysisFrames = srcFrames;
-    if (lutFile && fs.existsSync(lutFile)) {
-      log("Applying LUT to source frames...");
-      analysisFrames = await Promise.all(
-        srcFrames.map(async (fp, i) => {
-          const p = path.join(tempDir, `cr_src_lut_${id}_${i}.jpg`);
+    if (isDir) {
+      const images = fs
+        .readdirSync(refPath)
+        .filter((f) => IMAGE_EXTS.test(f))
+        .map((f) => path.join(refPath, f));
+      if (images.length === 0)
+        throw new Error(`Нет изображений в папке: ${refPath}`);
+      log(`Loading ${images.length} reference image(s)...`);
+      imagePaths = images;
+    } else {
+      // Видеофайл — извлекаем 5 кадров равномерно
+      const duration = await getVideoDuration(refPath);
+      const fractions = [0.1, 0.25, 0.5, 0.75, 0.9];
+      log(`Extracting ${fractions.length} frames from reference video...`);
+      imagePaths = await Promise.all(
+        fractions.map(async (frac, i) => {
+          const p = path.join(tempDir, `cr_ref_${id}_${i}.jpg`);
           tempFiles.push(p);
-          await applyLutToFrame(fp, p, lutFile);
+          await extractVideoFrame(refPath, duration * frac, p);
           return p;
         }),
       );
     }
 
-    log("Sampling pixels...");
-    const [refBufs, srcBufs] = await Promise.all([
-      Promise.all(refFrames.map(extractRgbBuffer)),
-      Promise.all(analysisFrames.map(extractRgbBuffer)),
-    ]);
-
-    const refBuf = averageBuffers(refBufs);
-    const srcBuf = averageBuffers(srcBufs);
-
-    log("Optimizing color parameters (2000 iterations)...");
-    const settings = optimizeSettings(refBuf, srcBuf);
-    log(
-      `Color result: contrast=${settings.contrast.toFixed(2)} brightness=${settings.brightness.toFixed(3)} saturation=${settings.saturation.toFixed(2)} gamma=${settings.gamma.toFixed(2)}`,
+    const bufs = await Promise.all(
+      imagePaths.map((p) => extractRgbBuffer(p).catch(() => null)),
     );
+    const valid = bufs.filter(Boolean) as Buffer[];
+    if (valid.length === 0)
+      throw new Error("Не удалось прочитать ни один референсный кадр");
 
-    return settings;
+    const profile = buildCDFs(valid);
+    log(
+      `Reference profile built from ${valid.length} image(s) (${profile.pixelCount.toLocaleString()} px)`,
+    );
+    return profile;
   } catch (err) {
     log(
-      `Color analysis failed: ${err instanceof Error ? err.message : String(err)}`,
+      `buildColorProfile failed: ${err instanceof Error ? err.message : String(err)}`,
     );
+    return null;
+  } finally {
+    for (const fp of tempFiles) {
+      try {
+        if (fs.existsSync(fp)) fs.unlinkSync(fp);
+      } catch {}
+    }
+  }
+}
+
+/**
+ * Анализирует цвет сегмента и возвращает строку FFmpeg-фильтра `curves`
+ * для точного согласования с референсным профилем.
+ *
+ * Сэмплируем 3 кадра из сегмента (начало, середина, конец) — это даёт
+ * репрезентативный срез, особенно важно при смешанных сценах.
+ *
+ * Гистограммное согласование аналитично (не случайный поиск):
+ * результат детерминирован и стабилен между сегментами.
+ */
+export async function analyzeSegmentColors(
+  sourceFile: string,
+  startTime: number,
+  segmentDuration: number,
+  refProfile: ColorProfile,
+  lutFile: string,
+  tempDir: string,
+): Promise<SegmentLUTs | null> {
+  const id = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const tempFiles: string[] = [];
+
+  try {
+    // 3 кадра: 15%, 50%, 85% от длительности сегмента
+    const offsets = [0.15, 0.5, 0.85].map((f) =>
+      Math.max(0, startTime + segmentDuration * f),
+    );
+
+    const srcBufs: Buffer[] = [];
+
+    for (let i = 0; i < offsets.length; i++) {
+      const rawFrame = path.join(tempDir, `cr_seg_${id}_${i}.jpg`);
+      const lutFrame = path.join(tempDir, `cr_seg_lut_${id}_${i}.jpg`);
+      tempFiles.push(rawFrame, lutFrame);
+
+      await extractVideoFrame(sourceFile, offsets[i]!, rawFrame);
+
+      let srcFrame = rawFrame;
+      if (lutFile && fs.existsSync(lutFile)) {
+        await applyLutToFrame(rawFrame, lutFrame, lutFile);
+        srcFrame = lutFrame;
+      }
+
+      const buf = await extractRgbBuffer(srcFrame).catch(() => null);
+      if (buf) srcBufs.push(buf);
+    }
+
+    if (srcBufs.length === 0) return null;
+
+    return buildSegmentLUTs(srcBufs, refProfile);
+  } catch {
     return null;
   } finally {
     for (const fp of tempFiles) {

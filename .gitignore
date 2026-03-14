@@ -7,3 +7,5 @@ luts/*.cube
 .claude
 CLAUDE.md
 config.json
+reference/*.png
+reference/*.jpg

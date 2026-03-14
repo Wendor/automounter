@@ -10,10 +10,27 @@ interface Props {
   currentLut: string;
   currentQuality: QualityLevel;
   currentOutput: string;
+  currentColorRef: string;
   cwd: string;
-  onDone: (res: { lut: string; quality: QualityLevel; output: string }) => void;
+  onDone: (res: {
+    lut: string;
+    quality: QualityLevel;
+    output: string;
+    colorRef?: string;
+  }) => void;
   onBack: () => void;
 }
+
+type Step =
+  | "lut_choice"
+  | "lut_browse"
+  | "lut_manual"
+  | "color_ref_choice"
+  | "color_ref_youtube"
+  | "color_ref_images"
+  | "color_ref_local"
+  | "quality"
+  | "confirm";
 
 const QUALITY_ITEMS = (Object.keys(QUALITY_TEMPLATES) as QualityLevel[]).map(
   (k) => ({
@@ -33,23 +50,23 @@ export const EditMode = ({
   currentLut,
   currentQuality,
   currentOutput,
+  currentColorRef,
   cwd,
   onDone,
   onBack,
 }: Props) => {
   const { width } = useTerminalDimensions();
-  const [step, setStep] = useState<
-    | "lut_choice"
-    | "lut_browse"
-    | "lut_manual"
-    | "quality"
-    | "output"
-    | "confirm"
-  >("lut_choice");
+  const [step, setStep] = useState<Step>("lut_choice");
   const [lut, setLut] = useState(currentLut);
   const [quality, setQuality] = useState(currentQuality);
-  const [output, setOutput] = useState(currentOutput);
+
+  const [colorRef, setColorRef] = useState(currentColorRef);
   const [inputVal, setInputVal] = useState("");
+
+  const goToStep = (s: Step, prefill = "") => {
+    setInputVal(prefill);
+    setStep(s);
+  };
 
   const selectStyles = {
     selectedBackgroundColor: THEME.accent,
@@ -98,12 +115,12 @@ export const EditMode = ({
               options={lutItems}
               onSelect={(idx) => {
                 const val = lutItems[idx].value;
-                if (val === "keep") setStep("quality");
+                if (val === "keep") goToStep("color_ref_choice");
                 else if (val === "none") {
                   setLut("");
-                  setStep("quality");
-                } else if (val === "browse") setStep("lut_browse");
-                else setStep("lut_manual");
+                  goToStep("color_ref_choice");
+                } else if (val === "browse") goToStep("lut_browse");
+                else goToStep("lut_manual", lut);
               }}
               focused={true}
               {...selectStyles}
@@ -118,12 +135,145 @@ export const EditMode = ({
             label="Select LUT file"
             onSelect={(p) => {
               setLut(p);
-              setStep("quality");
+              setStep("color_ref_choice");
             }}
-            onManual={() => setStep("lut_manual")}
+            onManual={() => goToStep("lut_manual")}
             onNone={() => {
               setLut("");
+              goToStep("color_ref_choice");
+            }}
+          />
+        );
+      case "lut_manual":
+        return (
+          <box style={{ flexDirection: "column" }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              Path to LUT (.cube):
+            </text>
+            <input
+              value={inputVal}
+              onInput={setInputVal}
+              onSubmit={(v: any) => {
+                setLut(String(v).trim() || lut);
+                goToStep("color_ref_choice");
+              }}
+              focused={true}
+              style={{ textColor: THEME.text }}
+            />
+          </box>
+        );
+      case "color_ref_choice":
+        const colorRefItems = [
+          ...(colorRef
+            ? [
+                {
+                  name: "Оставить текущий",
+                  description: colorRef.startsWith("http")
+                    ? colorRef.slice(0, 50)
+                    : path.basename(colorRef),
+                  value: "keep",
+                },
+              ]
+            : []),
+          {
+            name: "✕ Без референса",
+            description: "Только LUT цветокоррекция",
+            value: "none",
+          },
+          {
+            name: "◧ Папка с изображениями",
+            description: "jpg/png/webp референсные кадры",
+            value: "images",
+          },
+          {
+            name: "▶ YouTube URL",
+            description: "Ввести ссылку на видео",
+            value: "youtube",
+          },
+          {
+            name: "✎ Локальный видеофайл",
+            description: "mp4/mov на диске",
+            value: "local",
+          },
+        ];
+        return (
+          <box style={{ flexDirection: "column", flexGrow: 1 }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              Цветовой референс:
+            </text>
+            <select
+              options={colorRefItems}
+              onSelect={(idx) => {
+                const val = colorRefItems[idx]!.value;
+                if (val === "keep") goToStep("quality");
+                else if (val === "none") {
+                  setColorRef("");
+                  goToStep("quality");
+                } else if (val === "youtube") goToStep("color_ref_youtube", colorRef.startsWith("http") ? colorRef : "");
+                else if (val === "images") goToStep("color_ref_images", !colorRef.startsWith("http") ? colorRef : "");
+                else goToStep("color_ref_local");
+              }}
+              focused={true}
+              {...selectStyles}
+            />
+          </box>
+        );
+      case "color_ref_youtube":
+        return (
+          <box style={{ flexDirection: "column" }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              YouTube URL:
+            </text>
+            <input
+              value={inputVal}
+              placeholder="https://youtube.com/watch?v=..."
+              onInput={setInputVal}
+              onSubmit={(v: any) => {
+                const val = String(v).trim();
+                if (!val) return;
+                setColorRef(val);
+                goToStep("quality");
+              }}
+              focused={true}
+              style={{ textColor: THEME.text }}
+            />
+          </box>
+        );
+      case "color_ref_images":
+        return (
+          <box style={{ flexDirection: "column" }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              Путь к папке с изображениями:
+            </text>
+            <input
+              value={inputVal}
+              placeholder="./reference"
+              onInput={setInputVal}
+              onSubmit={(v: any) => {
+                const val = String(v).trim();
+                if (!val) return;
+                setColorRef(val);
+                goToStep("quality");
+              }}
+              focused={true}
+              style={{ textColor: THEME.text }}
+            />
+          </box>
+        );
+      case "color_ref_local":
+        return (
+          <FileBrowser
+            folder={cwd}
+            extensions={[".mp4", ".mov", ".mkv"]}
+            label="Выберите видео-референс"
+            onSelect={(p) => {
+              setColorRef(p);
               setStep("quality");
+            }}
+            onManual={() => goToStep("color_ref_youtube")}
+            onNone={() => {
+              setColorRef("");
+              goToStep("quality");
             }}
           />
         );
@@ -135,30 +285,13 @@ export const EditMode = ({
             </text>
             <select
               options={QUALITY_ITEMS}
+              selectedIndex={Math.max(0, QUALITY_ITEMS.findIndex((q) => q.value === quality))}
               onSelect={(idx) => {
                 setQuality(QUALITY_ITEMS[idx].value as QualityLevel);
-                setStep("output");
-              }}
-              focused={true}
-              {...selectStyles}
-            />
-          </box>
-        );
-      case "output":
-        return (
-          <box style={{ flexDirection: "column" }}>
-            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
-              Output Path:
-            </text>
-            <input
-              value={inputVal || output}
-              onInput={setInputVal}
-              onSubmit={(v: any) => {
-                setOutput(String(v) || output);
                 setStep("confirm");
               }}
               focused={true}
-              style={{ textColor: THEME.text }}
+              {...selectStyles}
             />
           </box>
         );
@@ -174,12 +307,13 @@ export const EditMode = ({
             </text>
             <select
               options={confirmItems}
+              selectedIndex={0}
               onSelect={(idx) => {
                 if (confirmItems[idx].value === "back") {
                   onBack();
                   return;
                 }
-                onDone({ lut, quality, output });
+                onDone({ lut, quality, output: currentOutput, colorRef: colorRef || undefined });
               }}
               focused={true}
               {...selectStyles}
@@ -231,6 +365,21 @@ export const EditMode = ({
           </box>
           <text style={{ fg: THEME.highlight }}>
             {truncate(lut ? path.basename(lut) : "—", maxValLen)}
+          </text>
+        </box>
+        <box style={{ flexDirection: "row" }}>
+          <box style={{ width: 12 }}>
+            <text style={{ fg: THEME.dim }}>Color ref: </text>
+          </box>
+          <text style={{ fg: THEME.highlight }}>
+            {truncate(
+              colorRef
+                ? colorRef.startsWith("http")
+                  ? colorRef.slice(0, 40)
+                  : path.basename(colorRef)
+                : "—",
+              maxValLen,
+            )}
           </text>
         </box>
         <box style={{ flexDirection: "row" }}>
