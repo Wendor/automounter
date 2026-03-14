@@ -12,6 +12,7 @@ export interface Config {
   output: string;
   bitrate: number; // Mbps, 0 = авто-определение
   quality: QualityLevel; // low | medium | high
+  colorRef?: string; // YouTube URL или путь к локальному видео-референсу
   lastSession?: RenderSession;
 }
 
@@ -56,6 +57,10 @@ function parseArgs(argv: string[]): Partial<Config> {
       result.quality = next as QualityLevel;
       i++;
     }
+    if (arg === "--color-ref" && next) {
+      result.colorRef = next;
+      i++;
+    }
   }
   return result;
 }
@@ -96,6 +101,7 @@ export function loadConfig(): Config {
       cli.output ?? file.output ?? path.join(process.cwd(), "final_edit.mp4"),
     bitrate: cli.bitrate ?? file.bitrate ?? 0,
     quality: cli.quality ?? file.quality ?? "medium",
+    colorRef: cli.colorRef ?? file.colorRef,
   };
 
   if (!merged.input)

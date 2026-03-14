@@ -23,6 +23,9 @@ type Step =
   | "lut_choice"
   | "lut_browse"
   | "lut_manual"
+  | "color_ref_choice"
+  | "color_ref_youtube"
+  | "color_ref_local"
   | "quality"
   | "confirm";
 
@@ -32,6 +35,7 @@ interface Form {
   prompt: string;
   duration: string;
   lut: string;
+  colorRef: string;
   quality: QualityLevel;
   model: string;
   output: string;
@@ -43,6 +47,7 @@ const STEPS: Step[] = [
   "prompt",
   "duration",
   "lut_choice",
+  "color_ref_choice",
   "quality",
   "confirm",
 ];
@@ -52,6 +57,7 @@ const STEP_LABELS = [
   "Промпт",
   "Длит",
   "LUT",
+  "Цвет",
   "Качество",
   "Старт",
 ];
@@ -78,6 +84,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
     prompt: saved.prompt ?? "",
     duration: String(saved.duration ?? 60),
     lut: saved.lut ?? "",
+    colorRef: saved.colorRef ?? "",
     quality: saved.quality ?? "medium",
     model: saved.model ?? "llava:13b",
     output: saved.output ?? path.join(cwd, "final_edit.mp4"),
@@ -90,7 +97,9 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
       ? "audio_choice"
       : step === "lut_browse" || step === "lut_manual"
         ? "lut_choice"
-        : step,
+        : step === "color_ref_youtube" || step === "color_ref_local"
+          ? "color_ref_choice"
+          : step,
   );
 
   const set = (field: keyof Form, value: string) =>
@@ -101,6 +110,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
       input: () => form.input,
       audio_manual: () => form.audio,
       lut_manual: () => form.lut,
+      color_ref_youtube: () => form.colorRef,
       prompt: () => form.prompt,
       duration: () => form.duration,
     };
@@ -299,10 +309,10 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
               options={lutItems}
               onSelect={(idx) => {
                 const val = lutItems[idx].value;
-                if (val === "keep") setStep("quality");
+                if (val === "keep") setStep("color_ref_choice");
                 else if (val === "none") {
                   set("lut", "");
-                  setStep("quality");
+                  setStep("color_ref_choice");
                 } else if (val === "browse") setStep("lut_browse");
                 else setStep("lut_manual");
               }}
@@ -319,12 +329,12 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             label="Выберите LUT файл"
             onSelect={(p) => {
               set("lut", p);
-              setStep("quality");
+              setStep("color_ref_choice");
             }}
             onManual={() => setStep("lut_manual")}
             onNone={() => {
               set("lut", "");
-              setStep("quality");
+              setStep("color_ref_choice");
             }}
           />
         );
@@ -340,12 +350,103 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
               onInput={setInputVal}
               onSubmit={(v: any) => {
                 set("lut", String(v).trim() || form.lut);
+                setStep("color_ref_choice");
+              }}
+              focused={true}
+              style={{ textColor: THEME.text }}
+            />
+          </box>
+        );
+      case "color_ref_choice":
+        const colorRefItems = [
+          ...(form.colorRef
+            ? [
+                {
+                  name: "Оставить текущий",
+                  description: form.colorRef.startsWith("http")
+                    ? form.colorRef.slice(0, 50)
+                    : path.basename(form.colorRef),
+                  value: "keep",
+                },
+              ]
+            : []),
+          {
+            name: "✕ Без референса",
+            description: "Только LUT цветокоррекция",
+            value: "none",
+          },
+          {
+            name: "▶ YouTube URL",
+            description: "Ввести ссылку на видео",
+            value: "youtube",
+          },
+          {
+            name: "✎ Локальный файл",
+            description: "Выбрать видео на диске",
+            value: "local",
+          },
+        ];
+        return (
+          <box style={{ flexDirection: "column", flexGrow: 1 }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              Цветовой референс:
+            </text>
+            <select
+              options={colorRefItems}
+              onSelect={(idx) => {
+                const val = colorRefItems[idx]!.value;
+                if (val === "keep") setStep("quality");
+                else if (val === "none") {
+                  set("colorRef", "");
+                  setStep("quality");
+                } else if (val === "youtube") setStep("color_ref_youtube");
+                else setStep("color_ref_local");
+              }}
+              focused={true}
+              {...selectStyles}
+            />
+          </box>
+        );
+      case "color_ref_youtube":
+        return (
+          <box style={{ flexDirection: "column" }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              YouTube URL:
+            </text>
+            <input
+              value={inputVal}
+              placeholder={form.colorRef || "https://youtube.com/watch?v=..."}
+              onInput={setInputVal}
+              onSubmit={(v: any) => {
+                const val = String(v).trim() || form.colorRef;
+                if (!val) {
+                  setError("Укажи URL");
+                  return;
+                }
+                set("colorRef", val);
                 setStep("quality");
               }}
               focused={true}
               style={{ textColor: THEME.text }}
             />
           </box>
+        );
+      case "color_ref_local":
+        return (
+          <FileBrowser
+            folder={cwd}
+            extensions={[".mp4", ".mov", ".mkv"]}
+            label="Выберите видео-референс"
+            onSelect={(p) => {
+              set("colorRef", p);
+              setStep("quality");
+            }}
+            onManual={() => setStep("color_ref_youtube")}
+            onNone={() => {
+              set("colorRef", "");
+              setStep("quality");
+            }}
+          />
         );
       case "quality":
         return (
@@ -393,6 +494,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
                   output: form.output,
                   bitrate: 0,
                   quality: form.quality,
+                  colorRef: form.colorRef || undefined,
                 });
               }}
               focused={true}

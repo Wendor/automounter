@@ -77,7 +77,12 @@ Respond ONLY JSON: {"excludeKeywords": [], "includeKeywords": [], "priorityKeywo
     });
     if (res.ok) {
       const data: any = await res.json();
-      return JSON.parse(cleanJSONString(data.response));
+      const parsed = JSON.parse(cleanJSONString(data.response));
+      return {
+        excludeKeywords: parsed.excludeKeywords ?? [],
+        includeKeywords: parsed.includeKeywords ?? [],
+        priorityKeywords: parsed.priorityKeywords ?? [],
+      };
     }
   } catch (e) {}
   return { excludeKeywords: [], includeKeywords: [], priorityKeywords: [] };

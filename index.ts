@@ -10,6 +10,11 @@ import { convertMp3ToWav, analyzeAudio } from "./src/audio";
 import { indexMediaFolder } from "./src/indexer";
 import { createDirectorPlan, preFilterFiles } from "./src/director";
 import { renderSegments, concatenateAndAddMusic } from "./src/render";
+import {
+  analyzeColorReference,
+  downloadYouTubeVideo,
+  eqFilterString,
+} from "./src/color_grading";
 import { showInkUI, showPipelineUI, PipelineCB } from "./src/ui/index";
 import {
   AudioAnalysis,
@@ -143,10 +148,31 @@ async function runMainPipeline(
   config: ReturnType<typeof loadConfig>,
   cb: PipelineCB,
 ): Promise<void> {
-  const TOTAL = 7;
   const runId = Date.now().toString(36);
   const TEMP_WAV = path.join(os.tmpdir(), `automounter_${runId}.wav`);
   const TEMP_DIR = path.join(os.tmpdir(), `automounter_${runId}`);
+
+  const hasColorRef = !!config.colorRef;
+  const stageNames = hasColorRef
+    ? [
+        "Анализ аудио",
+        "Сканирование",
+        "AI фильтрация",
+        "Индексация",
+        "Монтаж",
+        "Цвет. референс",
+        "Рендеринг",
+        "Сборка",
+      ]
+    : [
+        "Анализ аудио",
+        "Сканирование",
+        "AI фильтрация",
+        "Индексация",
+        "Монтаж",
+        "Рендеринг",
+        "Сборка",
+      ];
 
   const cleanup = (): void => {
     if (fs.existsSync(TEMP_WAV)) fs.unlinkSync(TEMP_WAV);
@@ -155,7 +181,7 @@ async function runMainPipeline(
   };
 
   try {
-    cb.stage(1, pipelineStageNames.create, 0);
+    cb.stage(1, stageNames, 0);
     cb.log("Converting MP3 to WAV...");
     await convertMp3ToWav(config.audio, TEMP_WAV);
 
@@ -165,7 +191,7 @@ async function runMainPipeline(
       `${audioAnalysis.tempo} BPM · ${audioAnalysis.style} · ${(audioAnalysis.energy * 100).toFixed(0)}% energy`,
     );
 
-    cb.stage(2, pipelineStageNames.create, 1);
+    cb.stage(2, stageNames, 1);
     cb.log(`Reading directory: ${config.input}`);
     const allFiles = fs
       .readdirSync(config.input)
@@ -180,7 +206,7 @@ async function runMainPipeline(
       date: fs.statSync(path.join(config.input, file)).birthtime.toISOString(),
     }));
 
-    cb.stage(3, pipelineStageNames.create, 2);
+    cb.stage(3, stageNames, 2);
     cb.log("Checking Ollama connection...");
     await checkOllamaAvailable(config.model);
 
@@ -195,7 +221,7 @@ async function runMainPipeline(
     }
     cb.info(`${requestedFileIds.length}/${allFiles.length} clips selected`);
 
-    cb.stage(4, pipelineStageNames.create, 3);
+    cb.stage(4, stageNames, 3);
     cb.log(
       `Indexing ${requestedFileIds.length} clips (AI Vision + Metrics)...`,
     );
@@ -214,7 +240,7 @@ async function runMainPipeline(
     const quality = await resolveQuality(config.quality, allFilePaths);
     cb.info(`${quality.bitrate} Mbps · ${quality.x264preset}`);
 
-    cb.stage(5, pipelineStageNames.create, 4);
+    cb.stage(5, stageNames, 4);
     cb.log("AI Director is building edit plan...");
     const plan = await createDirectorPlan(
       config.prompt,
@@ -229,7 +255,36 @@ async function runMainPipeline(
       `${plan.segments.length} scenes · ${plan.totalDuration.toFixed(1)}s`,
     );
 
-    cb.stage(6, pipelineStageNames.create, 5);
+    let eqFilter: string | undefined;
+    if (hasColorRef) {
+      cb.stage(6, stageNames, 5);
+      let refVideoPath = config.colorRef!;
+      if (refVideoPath.startsWith("http://") || refVideoPath.startsWith("https://")) {
+        cb.log("Downloading YouTube reference...");
+        const ytPath = path.join(TEMP_DIR, "color_reference.mp4");
+        fs.mkdirSync(TEMP_DIR, { recursive: true });
+        await downloadYouTubeVideo(refVideoPath, ytPath);
+        refVideoPath = ytPath;
+        cb.info("Download complete");
+      }
+      const uniqueSources = [
+        ...new Set(plan.segments.map((s) => s.sourceFile)),
+      ];
+      cb.log(`Analyzing colors (${uniqueSources.length} source clip(s))...`);
+      const colorSettings = await analyzeColorReference(
+        refVideoPath,
+        uniqueSources,
+        config.lut,
+        TEMP_DIR,
+        (msg) => cb.log(msg),
+      );
+      if (colorSettings) {
+        eqFilter = eqFilterString(colorSettings);
+        cb.info(`Applied: ${eqFilter}`);
+      }
+    }
+
+    cb.stage(hasColorRef ? 7 : 6, stageNames, hasColorRef ? 6 : 5);
     cb.log("Parallel segment rendering started...");
     const segProgressMap = new Map<number, number>();
     const segTotal = plan.segments.length;
@@ -248,9 +303,10 @@ async function runMainPipeline(
         ).length;
         cb.renderTick(segIdx, pct, done, segTotal);
       },
+      eqFilter,
     );
 
-    cb.stage(7, pipelineStageNames.create, 6);
+    cb.stage(hasColorRef ? 8 : 7, stageNames, hasColorRef ? 7 : 6);
     cb.log("Final assembly and audio mixing...");
     const segmentConcatInfo = plan.segments.map((seg, i) => ({
       file: sliceResult.files[i] ?? seg.outputFile,

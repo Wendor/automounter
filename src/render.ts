@@ -59,6 +59,7 @@ function buildVideoFilter(
   hasLut: boolean,
   videoFadeDuration: number,
   quality: RenderQuality,
+  eqFilter?: string,
 ): string {
   const filters: string[] = [];
   filters.push(
@@ -80,6 +81,7 @@ function buildVideoFilter(
   filters.push(`setpts=${segment.ptsFactor}*PTS`);
   if (segment.ptsFactor < 0.65) filters.push("tmix=frames=3:weights=1 2 1");
   if (hasLut) filters.push(`lut3d='${formatLutPathForFFmpeg(lutFile)}'`);
+  if (eqFilter) filters.push(eqFilter);
 
   const fadeOutStart = Math.max(0, segment.targetDuration - videoFadeDuration);
   switch (effect) {
@@ -113,6 +115,7 @@ function renderSegment(
   videoFadeDuration: number,
   quality: RenderQuality,
   onProgress?: RenderProgressCallback,
+  eqFilter?: string,
 ): Promise<void> {
   if (fs.existsSync(segment.outputFile)) {
     onProgress?.(index, 100);
@@ -124,6 +127,7 @@ function renderSegment(
     hasLut,
     videoFadeDuration,
     quality,
+    eqFilter,
   );
   return new Promise((resolve, reject) => {
     ffmpeg(segment.sourceFile)
@@ -177,6 +181,7 @@ async function renderWithConcurrency(
   quality: RenderQuality,
   concurrency: number,
   onProgress?: RenderProgressCallback,
+  eqFilter?: string,
 ): Promise<void> {
   let i = 0;
   const worker = async (): Promise<void> => {
@@ -194,6 +199,7 @@ async function renderWithConcurrency(
           videoFadeDuration,
           quality,
           onProgress,
+          eqFilter,
         );
     }
   };
@@ -208,6 +214,7 @@ export async function renderSegments(
   totalDuration: number,
   quality: RenderQuality,
   onProgress?: RenderProgressCallback,
+  eqFilter?: string,
 ): Promise<SliceResult> {
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
   const codec = detectVideoCodec();
@@ -224,6 +231,7 @@ export async function renderSegments(
     quality,
     concurrency,
     onProgress,
+    eqFilter,
   );
   return { files: segments.map((s) => s.outputFile), totalDuration, targetFps };
 }

@@ -128,7 +128,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
             prev.length === 0
               ? Array.from({ length: total }, (_, i) => {
                   return {
-                    label,
+                    label: i === n - 1 ? label : (stages[i] ?? "..."),
                     status: "pending" as StageStatus,
                     detail: "",
                     progress: -1,
