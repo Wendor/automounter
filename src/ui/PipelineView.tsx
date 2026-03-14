@@ -119,27 +119,16 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
     const cb: PipelineCB = {
       stage(n, stages, current) {
         const total = stages.length;
-        const label = stages[current];
-        const MAIN_STAGE_NAMES = [
-          "Анализ аудио",
-          "Сканирование",
-          "AI фильтрация",
-          "Индексация",
-          "Монтаж",
-          "Рендеринг",
-          "Сборка",
-        ];
+        const label = stages[current] ? stages[current]! : `Stage ${n}`;
+
         currentStageRef.current = n;
         totalStagesRef.current = total;
         setStages((prev) => {
           let next =
             prev.length === 0
               ? Array.from({ length: total }, (_, i) => {
-                  let stageLabel =
-                    total === 7 ? (MAIN_STAGE_NAMES[i] ?? "...") : `...`;
-                  if (i === n - 1) stageLabel = label;
                   return {
-                    label: stageLabel,
+                    label,
                     status: "pending" as StageStatus,
                     detail: "",
                     progress: -1,
@@ -425,14 +414,14 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
               </box>
               {s.detail ? (
                 <text style={{ fg: THEME.dim, marginLeft: 2 }}>
-                  {truncate(s.detail, 30)}
+                  {truncate(s.detail, 40)}
                 </text>
               ) : null}
               {s.status === "active" && s.progress >= 0 ? (
                 <box style={{ marginLeft: 2, marginTop: 0 }}>
                   <ProgressBar
                     value={s.progress}
-                    width={31}
+                    width={41}
                     fg={THEME.highlight}
                   />
                 </box>
