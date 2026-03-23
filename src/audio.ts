@@ -1,6 +1,13 @@
 import * as fs from "fs";
 import ffmpeg from "fluent-ffmpeg";
 import { AudioData, AudioAnalysis, AudioStyle, AudioSection } from "./types";
+import {
+  TRANSIENT_WINDOW_SEC,
+  ENERGY_WINDOW_SEC,
+  TRANSIENT_THRESHOLD,
+  DROP_HIGH_THRESHOLD,
+  DROP_LOW_THRESHOLD,
+} from "./constants";
 
 interface WavDecoder {
   decode(buffer: Buffer): AudioData;
@@ -78,7 +85,7 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
 
   // ─── 2. Peak (Transient) detection ────────────────────────────────────────
   // Ищем резкие скачки громкости (onset)
-  const winShort = Math.floor(0.05 * sampleRate); // 50ms window
+  const winShort = Math.floor(TRANSIENT_WINDOW_SEC * sampleRate); // 50ms window
   const hopShort = Math.floor(winShort / 2);
   const shortRms: number[] = [];
   const shortTimes: number[] = [];
@@ -97,14 +104,14 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
     const prev = shortRms[i - 1] ?? 0;
     const curr = shortRms[i] ?? 0;
     const next = shortRms[i + 1] ?? 0;
-    // Пик должен быть больше соседей и > 25% от максимума
-    if (curr > prev && curr > next && curr > maxShortRms * 0.25) {
+    // Пик должен быть больше соседей и > TRANSIENT_THRESHOLD от максимума
+    if (curr > prev && curr > next && curr > maxShortRms * TRANSIENT_THRESHOLD) {
       peaks.push(shortTimes[i] ?? 0);
     }
   }
 
   // ─── 3. Overall energy analysis ───────────────────────────────────────────
-  const windowSamples = Math.floor(2.0 * sampleRate);
+  const windowSamples = Math.floor(ENERGY_WINDOW_SEC * sampleRate);
   const hopSamples = Math.floor(windowSamples / 2);
   const rmsValues: number[] = [];
   const windowTimes: number[] = [];
@@ -128,7 +135,7 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
 
   const drops: number[] = [];
   for (let i = 1; i < normalizedRms.length; i++) {
-    if ((normalizedRms[i] ?? 0) > 0.75 && (normalizedRms[i - 1] ?? 1) < 0.4) {
+    if ((normalizedRms[i] ?? 0) > DROP_HIGH_THRESHOLD && (normalizedRms[i - 1] ?? 1) < DROP_LOW_THRESHOLD) {
       drops.push(windowTimes[i] ?? 0);
     }
   }
@@ -137,7 +144,7 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
 
   const sections: AudioSection[] = normalizedRms.map((energy, i) => ({
     start: windowTimes[i] ?? 0,
-    end: (windowTimes[i] ?? 0) + 2.0,
+    end: (windowTimes[i] ?? 0) + ENERGY_WINDOW_SEC,
     energy: energy,
     style: classifyStyle(tempoNum, energy),
   }));

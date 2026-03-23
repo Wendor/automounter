@@ -4,14 +4,14 @@ import * as fs from "fs";
 import * as path from "path";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffprobeInstaller from "@ffprobe-installer/ffprobe";
+import { formatLutPath, safeDelete } from "./utils";
+import { EVAL_RES, CHROMA_WEIGHT, CURVE_SAMPLES } from "./constants";
 
 const execFileAsync = promisify(execFile);
 const FFMPEG = ffmpegInstaller.path;
 const FFPROBE = ffprobeInstaller.path;
 
-// Разрешение кадра для анализа: 256×256 даёт 65536 пикселей — достаточно для
-// точных гистограмм, не слишком дорого по времени.
-const EVAL_RES = 512;
+// Разрешение кадра для анализа импортируется из constants.ts
 const IMAGE_EXTS = /\.(jpe?g|png|webp|tiff?)$/i;
 const hwaccelArgs: string[] =
   process.platform === "darwin" ? ["-hwaccel", "videotoolbox"] : [];
@@ -129,9 +129,7 @@ function buildReinhardLUT(srcStats: ChannelStats, refStats: ChannelStats): Uint8
   return lut;
 }
 
-// Точки семплирования кривой для curves-фильтра FFmpeg.
-// 9 точек достаточно для точного представления гистограммного LUT.
-const CURVE_SAMPLES = [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255];
+// Точки семплирования кривой для curves-фильтра FFmpeg импортируются из constants.ts
 
 function lutToCurvePoints(lut: Uint8Array): string {
   return CURVE_SAMPLES.map(
@@ -139,11 +137,7 @@ function lutToCurvePoints(lut: Uint8Array): string {
   ).join(" ");
 }
 
-// Доля per-channel коррекции vs luma-only.
-// Reinhard сам по себе безопасен для нейтралей: если R/G/B имеют одинаковые
-// mean/std, все каналы сдвигаются одинаково → цветовой каст не возникает.
-// Поэтому можно держать CHROMA_WEIGHT высоким для полноценного контраста.
-const CHROMA_WEIGHT = 0.85;
+// Доля per-channel коррекции vs luma-only импортируется из constants.ts (CHROMA_WEIGHT).
 
 /**
  * Строит SegmentLUTs методом Reinhard color transfer.
@@ -265,9 +259,6 @@ async function extractVideoFrame(
   ]);
 }
 
-function formatLutPath(lutPath: string): string {
-  return lutPath.replace(/\\/g, "/").replace(/^([a-zA-Z]):/, "$1\\:");
-}
 
 async function applyLutToFrame(
   inputPath: string,
@@ -375,9 +366,7 @@ export async function buildColorProfile(
     return null;
   } finally {
     for (const fp of tempFiles) {
-      try {
-        if (fs.existsSync(fp)) fs.unlinkSync(fp);
-      } catch {}
+      safeDelete(fp);
     }
   }
 }
@@ -435,9 +424,7 @@ export async function analyzeSegmentColors(
     return null;
   } finally {
     for (const fp of tempFiles) {
-      try {
-        if (fs.existsSync(fp)) fs.unlinkSync(fp);
-      } catch {}
+      safeDelete(fp);
     }
   }
 }

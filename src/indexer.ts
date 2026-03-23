@@ -2,8 +2,9 @@ import * as fs from "fs";
 import * as path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import { VideoInfo, ValidZone } from "./types";
-
-const CACHE_VERSION = 8;
+import { cleanJSONString, safeDelete } from "./utils";
+import { reverseGeocode } from "./services/geocoding";
+import { CACHE_VERSION, OLLAMA_URL, LLM_KEEP_ALIVE } from "./constants";
 const DEV_NULL = process.platform === "win32" ? "NUL" : "/dev/null";
 
 interface VisionAIResponse {
@@ -52,27 +53,6 @@ function cleanAiArray(input: any): string[] {
     );
 }
 
-async function fetchAddress(
-  lat: number,
-  lon: number,
-): Promise<string | undefined> {
-  try {
-    const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&addressdetails=1`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": "AutomounterVideoBot/1.0" },
-    });
-    if (res.ok) {
-      const data: any = await res.json();
-      const a = data.address;
-      const city = a.city || a.town || a.village || a.suburb || a.county || "";
-      const country = a.country || "";
-      return city && country
-        ? `${city}, ${country}`
-        : country || city || undefined;
-    }
-  } catch (e) {}
-  return undefined;
-}
 
 function extractGpsFromSrt(
   srtPath: string,
@@ -228,13 +208,6 @@ function extractKeyframe(
   });
 }
 
-function cleanJSONString(rawStr: string): string {
-  const regex = new RegExp(
-    "\\x60\\x60\\x60(?:json)?\\s*([\\s\\S]*?)\\s*\\x60\\x60\\x60",
-  );
-  const match = rawStr.match(regex);
-  return match ? (match[1] ?? rawStr) : rawStr;
-}
 
 async function evaluateFrameWithVisionAI(
   imagePath: string,
@@ -257,7 +230,7 @@ async function evaluateFrameWithVisionAI(
   "motionEstimate": <0.0 static - 1.0 very fast>
 }`;
   try {
-    const response = await fetch("http://localhost:11434/api/generate", {
+    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -266,7 +239,7 @@ async function evaluateFrameWithVisionAI(
         images: [base64Image],
         format: "json",
         stream: false,
-        keep_alive: "20m", // Явно держим модель в памяти 20 минут
+        keep_alive: LLM_KEEP_ALIVE,
       }),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -324,10 +297,7 @@ export async function indexMediaFolder(
   if (requestedFiles && requestedFiles.length > 0)
     files = files.filter((f) => requestedFiles.includes(f));
   const videos: VideoInfo[] = [];
-  const addressCache = new Map<string, string>();
-
   for (let i = 0; i < files.length; i++) {
-    const startFile = Date.now();
     const filename = files[i]!;
     const filePath = path.join(dirPath, filename);
     const metadataPath = `${filePath}.json`;
@@ -366,17 +336,11 @@ export async function indexMediaFolder(
         console.log(
           `  -> GPS (${gpsInfo.source}): ${gpsInfo.lat.toFixed(4)}, ${gpsInfo.lon.toFixed(4)}`,
         );
-        const cacheKey = `${gpsInfo.lat.toFixed(3)},${gpsInfo.lon.toFixed(3)}`;
-        let address = addressCache.get(cacheKey);
-        if (!address) {
-          address = await fetchAddress(gpsInfo.lat, gpsInfo.lon);
-          if (address) {
-            addressCache.set(cacheKey, address);
-            console.log(`  -> Location: ${address}`);
-          }
-          await new Promise((r) => setTimeout(r, 1000));
+        const address = await reverseGeocode(gpsInfo.lat, gpsInfo.lon);
+        if (address) {
+          console.log(`  -> Location: ${address}`);
         }
-        location = { lat: gpsInfo.lat, lon: gpsInfo.lon, address };
+        location = { lat: gpsInfo.lat, lon: gpsInfo.lon, address: address ?? undefined };
       }
 
       const duration = probeData.format.duration || 0;
@@ -401,7 +365,6 @@ export async function indexMediaFolder(
         const results: VisionAIResponse[] = [];
         console.log(`-> Vision AI`);
         for (let j = 0; j < timestamps.length; j++) {
-          const kt = Date.now();
           const imgPath = path.join(tempDir, `thumb_${filename}_${j}.jpg`);
           try {
             await extractKeyframe(
@@ -410,7 +373,7 @@ export async function indexMediaFolder(
               imgPath,
             );
             results.push(await evaluateFrameWithVisionAI(imgPath, visionModel));
-            if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+            safeDelete(imgPath);
             console.log(`- Frame ${j + 1}/${timestamps.length}`);
           } catch (e) {}
         }

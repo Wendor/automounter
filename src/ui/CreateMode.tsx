@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useTerminalDimensions } from "@opentui/react";
 import * as path from "path";
 import { Config } from "../config";
-import { QualityLevel, QUALITY_TEMPLATES } from "../types";
+import { QualityLevel, Orientation, QUALITY_TEMPLATES } from "../types";
 import { FileBrowser } from "./FileBrowser";
 import { THEME } from "./index";
 
@@ -28,6 +28,7 @@ type Step =
   | "color_ref_images"
   | "color_ref_local"
   | "quality"
+  | "orientation"
   | "confirm";
 
 interface Form {
@@ -38,6 +39,7 @@ interface Form {
   lut: string;
   colorRef: string;
   quality: QualityLevel;
+  orientation: Orientation;
   model: string;
   output: string;
 }
@@ -50,6 +52,7 @@ const STEPS: Step[] = [
   "lut_choice",
   "color_ref_choice",
   "quality",
+  "orientation",
   "confirm",
 ];
 const STEP_LABELS = [
@@ -60,6 +63,7 @@ const STEP_LABELS = [
   "LUT",
   "Цвет",
   "Качество",
+  "Формат",
   "Старт",
 ];
 
@@ -87,6 +91,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
     lut: saved.lut ?? "",
     colorRef: saved.colorRef ?? "",
     quality: saved.quality ?? "medium",
+    orientation: saved.orientation ?? "horizontal",
     model: saved.model ?? "llava:13b",
     output: saved.output ?? path.join(cwd, "final_edit.mp4"),
   });
@@ -485,6 +490,28 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
               selectedIndex={Math.max(0, QUALITY_ITEMS.findIndex((q) => q.value === form.quality))}
               onSelect={(idx) => {
                 set("quality", QUALITY_ITEMS[idx].value);
+                setStep("orientation");
+              }}
+              focused={true}
+              {...selectStyles}
+            />
+          </box>
+        );
+      case "orientation":
+        const orientationItems = [
+          { name: "⬛ Горизонтальное 16:9", description: "1920×1080 — YouTube, ПК", value: "horizontal" },
+          { name: "▮ Вертикальное 9:16", description: "1080×1920 — Reels, TikTok, Shorts", value: "vertical" },
+        ];
+        return (
+          <box style={{ flexDirection: "column", flexGrow: 1 }}>
+            <text style={{ fg: THEME.accent, marginBottom: 1 }}>
+              Формат видео:
+            </text>
+            <select
+              options={orientationItems}
+              selectedIndex={form.orientation === "vertical" ? 1 : 0}
+              onSelect={(idx) => {
+                set("orientation", orientationItems[idx].value);
                 setStep("confirm");
               }}
               focused={true}
@@ -521,6 +548,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
                   output: form.output,
                   bitrate: 0,
                   quality: form.quality,
+                  orientation: form.orientation,
                   colorRef: form.colorRef || undefined,
                 });
               }}

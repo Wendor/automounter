@@ -23,7 +23,7 @@ import {
   downloadYouTubeVideo,
   SegmentLUTs,
 } from "./src/color_grading";
-import { showInkUI, showPipelineUI, PipelineCB } from "./src/ui/index";
+import { showInkUI, showPipelineUI, cleanupTerminal, PipelineCB } from "./src/ui/index";
 import {
   AudioAnalysis,
   VideoInfo,
@@ -55,6 +55,21 @@ const pipelineStageNames: Record<string, string[]> = {
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
+
+// ─── Обработчики сигналов ─────────────────────────────────────────────────────
+process.on("SIGINT", () => {
+  cleanupTerminal();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  cleanupTerminal();
+  process.exit(0);
+});
+process.on("uncaughtException", (e) => {
+  cleanupTerminal();
+  console.error(e);
+  process.exit(1);
+});
 
 // ─── Console-based callbacks (batch / --batch mode) ───────────────────────────
 
@@ -346,6 +361,7 @@ async function runMainPipeline(
       0.5,
       plan.totalDuration,
       quality,
+      config.orientation ?? "horizontal",
       (segIdx, pct) => {
         segProgressMap.set(segIdx, pct);
         const done = [...segProgressMap.values()].filter(
@@ -382,6 +398,7 @@ async function runMainPipeline(
       targetFps: sliceResult.targetFps,
       audio: config.audio,
       renderedAt: new Date().toISOString(),
+      orientation: config.orientation ?? "horizontal",
     };
     config.lastSession = session;
     saveConfig(config);
@@ -478,6 +495,7 @@ async function runEditPipeline(
       0.5,
       session.totalDuration,
       quality,
+      session.orientation ?? "horizontal",
       (segIdx, pct) => {
         segProgressMap.set(segIdx, pct);
         const done = [...segProgressMap.values()].filter(

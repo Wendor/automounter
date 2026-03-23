@@ -5,7 +5,10 @@ import {
   VideoSegment,
   SliceResult,
   RenderQuality,
+  Orientation,
 } from "./types";
+import { formatLutPath, safeDelete } from "./utils";
+import { BASE_WIDTH, BASE_HEIGHT, VERTICAL_WIDTH, VERTICAL_HEIGHT, ZOOM_DELTA } from "./constants";
 
 export type RenderProgressCallback = (
   segmentIndex: number,
@@ -40,9 +43,8 @@ function computeMajorityFps(segments: VideoSegment[]): number {
   return best;
 }
 
-export function formatLutPathForFFmpeg(absolutePath: string): string {
-  return absolutePath.replace(/\\/g, "/").replace(/^([a-zA-Z]):/, "$1\\:");
-}
+/** @deprecated Используй formatLutPath из utils.ts */
+export const formatLutPathForFFmpeg = formatLutPath;
 
 function timemarkToSeconds(timemark: string): number {
   const parts = timemark.split(":");
@@ -59,49 +61,63 @@ function buildVideoFilter(
   videoFadeDuration: number,
   quality: RenderQuality,
   targetFps: number,
+  orientation: Orientation,
 ): string {
+  const outW = orientation === "vertical" ? VERTICAL_WIDTH : BASE_WIDTH;
+  const outH = orientation === "vertical" ? VERTICAL_HEIGHT : BASE_HEIGHT;
+
   const filters: string[] = [];
+
+  // Для вертикального: масштабируем по высоте, обрезаем ширину из центра.
+  // Для горизонтального: масштабируем по ширине, обрезаем высоту из центра.
   filters.push(
-    "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1",
+    `scale=${orientation === "vertical" ? "-2" : outW}:${orientation === "vertical" ? outH : "-2"}` +
+    `:force_original_aspect_ratio=increase,crop=${outW}:${outH},setsar=1`,
   );
 
   const totalFrames = Math.max(1, Math.round(segment.targetDuration * targetFps));
 
-  // Зум через scale:eval=frame + crop с фиксированным выходом (1920x1080).
-  // zoompan несовместим с DJI H.264/B-frames → "Invalid argument".
-  // scale:eval=frame меняет только SWS-контекст каждый кадр, crop-выход остаётся фиксированным.
+  // Зум через scale:eval=frame + crop с фиксированным выходом.
+  // Для вертикального зум идёт по высоте, для горизонтального — по ширине.
   if (segment.zoomEffect === "zoomIn") {
-    // Ширина 1920→2074 (+8%), crop центрирует → контент плавно приближается
-    // h=-2: всегда чётное (yuv420p требует чётных размеров)
-    filters.push(
-      `scale=w='trunc((1920+154*n/${totalFrames})/2)*2':h=-2:eval=frame,crop=1920:1080`,
-    );
+    if (orientation === "vertical") {
+      filters.push(
+        `scale=w=-2:h='trunc((${outH}+${ZOOM_DELTA}*n/${totalFrames})/2)*2':eval=frame,crop=${outW}:${outH}`,
+      );
+    } else {
+      filters.push(
+        `scale=w='trunc((${outW}+${ZOOM_DELTA}*n/${totalFrames})/2)*2':h=-2:eval=frame,crop=${outW}:${outH}`,
+      );
+    }
   } else if (segment.zoomEffect === "zoomOut") {
-    // Ширина 2074→1920 (-8%), crop центрирует → контент плавно отдаляется
-    filters.push(
-      `scale=w='trunc((2074-154*n/${totalFrames})/2)*2':h=-2:eval=frame,crop=1920:1080`,
-    );
+    if (orientation === "vertical") {
+      filters.push(
+        `scale=w=-2:h='trunc((${outH + ZOOM_DELTA}-${ZOOM_DELTA}*n/${totalFrames})/2)*2':eval=frame,crop=${outW}:${outH}`,
+      );
+    } else {
+      filters.push(
+        `scale=w='trunc((${outW + ZOOM_DELTA}-${ZOOM_DELTA}*n/${totalFrames})/2)*2':h=-2:eval=frame,crop=${outW}:${outH}`,
+      );
+    }
   }
 
   filters.push(`setpts=${segment.ptsFactor}*PTS`);
   if (segment.ptsFactor < 0.65) filters.push("tmix=frames=3:weights=1 2 1");
-  if (hasLut) filters.push(`lut3d='${formatLutPathForFFmpeg(lutFile)}'`);
+  if (hasLut) filters.push(`lut3d='${formatLutPath(lutFile)}'`);
   if (segment.eqFilter) filters.push(segment.eqFilter);
 
-  // Эффект входа (начало сегмента)
   const fadeOutStart = Math.max(0, segment.targetDuration - videoFadeDuration);
   if (segment.entryEffect === "fadeIn")
     filters.push(`fade=t=in:st=0:d=${videoFadeDuration}`);
   else if (segment.entryEffect === "flashIn")
     filters.push(`fade=t=in:st=0:d=${videoFadeDuration}:color=white`);
 
-  // Эффект выхода (конец сегмента)
   if (segment.exitEffect === "fadeOut")
     filters.push(`fade=t=out:st=${fadeOutStart}:d=${videoFadeDuration}`);
   else if (segment.exitEffect === "flashOut")
     filters.push(`fade=t=out:st=${fadeOutStart}:d=${videoFadeDuration}:color=white`);
 
-  filters.push("scale=1920:1080,setsar=1,format=yuv420p");
+  filters.push(`scale=${outW}:${outH},setsar=1,format=yuv420p`);
   return filters.join(",");
 }
 
@@ -114,13 +130,14 @@ function runFfmpegSegment(
   lutFile: string,
   videoFadeDuration: number,
   quality: RenderQuality,
+  orientation: Orientation,
   onProgress?: RenderProgressCallback,
   index?: number,
 ): Promise<void> {
   const seg = overrideZoom === segment.zoomEffect
     ? segment
     : { ...segment, zoomEffect: overrideZoom };
-  const videoFilter = buildVideoFilter(seg, lutFile, hasLut, videoFadeDuration, quality, targetFps);
+  const videoFilter = buildVideoFilter(seg, lutFile, hasLut, videoFadeDuration, quality, targetFps, orientation);
   return new Promise((resolve, reject) => {
     ffmpeg(segment.sourceFile)
       .inputOptions(["-ss", String(segment.startTime), "-t", String(segment.rawDuration)])
@@ -152,6 +169,7 @@ async function renderSegment(
   lutFile: string,
   videoFadeDuration: number,
   quality: RenderQuality,
+  orientation: Orientation,
   onProgress?: RenderProgressCallback,
   total?: number,
 ): Promise<void> {
@@ -166,13 +184,12 @@ async function renderSegment(
   console.log(`  Rendering [${index + 1}${totalStr}] ${name}  ${segment.targetDuration.toFixed(1)}s (speed ${speedPct}%)  ${fx}`);
 
   try {
-    await runFfmpegSegment(segment, segment.zoomEffect, codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, onProgress, index);
+    await runFfmpegSegment(segment, segment.zoomEffect, codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, orientation, onProgress, index);
   } catch (err) {
-    // zoompan падает на VFR/B-frames DJI footage — повторяем без zoom
     if (segment.zoomEffect !== "none") {
       console.warn(`  [zoom fallback] ${name}: retry without zoom`);
-      if (fs.existsSync(segment.outputFile)) fs.unlinkSync(segment.outputFile);
-      await runFfmpegSegment(segment, "none", codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, onProgress, index);
+      safeDelete(segment.outputFile);
+      await runFfmpegSegment(segment, "none", codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, orientation, onProgress, index);
     } else {
       throw err;
     }
@@ -187,6 +204,7 @@ async function renderWithConcurrency(
   lutFile: string,
   videoFadeDuration: number,
   quality: RenderQuality,
+  orientation: Orientation,
   concurrency: number,
   onProgress?: RenderProgressCallback,
 ): Promise<void> {
@@ -205,6 +223,7 @@ async function renderWithConcurrency(
           lutFile,
           videoFadeDuration,
           quality,
+          orientation,
           onProgress,
           segments.length,
         );
@@ -220,6 +239,7 @@ export async function renderSegments(
   videoFadeDuration: number,
   totalDuration: number,
   quality: RenderQuality,
+  orientation: Orientation,
   onProgress?: RenderProgressCallback,
 ): Promise<SliceResult> {
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
@@ -227,6 +247,7 @@ export async function renderSegments(
   const hasLut = fs.existsSync(lutFile);
   const targetFps = computeMajorityFps(segments);
   const concurrency = codec === "h264_videotoolbox" ? 3 : 2;
+  console.log(`Render: ${orientation} ${orientation === "vertical" ? "1080×1920" : "1920×1080"}`);
   await renderWithConcurrency(
     segments,
     codec,
@@ -235,6 +256,7 @@ export async function renderSegments(
     lutFile,
     videoFadeDuration,
     quality,
+    orientation,
     concurrency,
     onProgress,
   );
@@ -326,7 +348,7 @@ export async function concatenateAndAddMusic(
   for (let i = 0; i < segments.length; i += CHUNK_SIZE) {
     const slice = segments.slice(i, i + CHUNK_SIZE);
     const chunkPath = path.join(tempDir, `chunk_${chunks.length}.mp4`);
-    if (fs.existsSync(chunkPath)) fs.unlinkSync(chunkPath);
+    safeDelete(chunkPath);
     console.log(
       `  -> Assembling chunk ${chunks.length + 1}/${Math.ceil(segments.length / CHUNK_SIZE)}...`,
     );

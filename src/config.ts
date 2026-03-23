@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { QualityLevel, RenderSession } from "./types";
+import { QualityLevel, Orientation, RenderSession } from "./types";
 
 export interface Config {
   input: string;
@@ -12,6 +12,7 @@ export interface Config {
   output: string;
   bitrate: number; // Mbps, 0 = авто-определение
   quality: QualityLevel; // low | medium | high
+  orientation: Orientation; // horizontal | vertical
   colorRef?: string; // YouTube URL или путь к локальному видео-референсу
   lastSession?: RenderSession;
 }
@@ -55,6 +56,10 @@ function parseArgs(argv: string[]): Partial<Config> {
     }
     if (arg === "--quality" && next) {
       result.quality = next as QualityLevel;
+      i++;
+    }
+    if (arg === "--orientation" && next) {
+      result.orientation = next as Orientation;
       i++;
     }
     if (arg === "--color-ref" && next) {
@@ -101,6 +106,7 @@ export function loadConfig(): Config {
       cli.output ?? file.output ?? path.join(process.cwd(), "final_edit.mp4"),
     bitrate: cli.bitrate ?? file.bitrate ?? 0,
     quality: cli.quality ?? file.quality ?? "medium",
+    orientation: cli.orientation ?? file.orientation ?? "horizontal",
     colorRef: cli.colorRef ?? file.colorRef,
   };
 

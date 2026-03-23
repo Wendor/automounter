@@ -10,16 +10,16 @@ import {
   EntryEffect,
   ExitEffect,
 } from "./types";
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function cleanJSONString(rawStr: string): string {
-  const mdMatch = rawStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (mdMatch) return mdMatch[1] ?? rawStr;
-  const objMatch = rawStr.match(/\{[\s\S]*\}/);
-  if (objMatch) return objMatch[0];
-  return rawStr;
-}
+import { cleanJSONString } from "./utils";
+import { geocodeLocationNames, GeocodedLocation } from "./services/geocoding";
+import {
+  OLLAMA_URL,
+  DEFAULT_TEXT_MODEL,
+  LLM_TIMEOUT_MS,
+  LLM_KEEP_ALIVE,
+  PREFILTER_KM,
+  ON_LOCATION_KM,
+} from "./constants";
 
 function getEnergyAtBeat(beatTime: number, sections: AudioSection[]): number {
   return (
@@ -38,22 +38,38 @@ function shuffle<T>(arr: T[]): T[] {
 
 function shuffledPool(videos: VideoInfo[], keywords: string[] = []): VideoInfo[] {
   const kws = keywords.map((k) => k.toLowerCase());
+  const hasKeyword = (v: VideoInfo): boolean => {
+    if (kws.length === 0) return false;
+    const text = ((v.tags?.join(" ") ?? "") + " " + (v.description ?? "")).toLowerCase();
+    return kws.some((k) => text.includes(k));
+  };
   const keywordScore = (v: VideoInfo): number => {
     if (kws.length === 0) return 0;
     const text = ((v.tags?.join(" ") ?? "") + " " + (v.description ?? "")).toLowerCase();
     return kws.filter((k) => text.includes(k)).length / kws.length;
   };
-  // Итоговый score: 70% aesthetic + 30% keyword coverage
-  const sorted = [...videos].sort((a, b) => {
-    const scoreA = (a.aestheticScore ?? 0) * 0.7 + keywordScore(a) * 10 * 0.3;
-    const scoreB = (b.aestheticScore ?? 0) * 0.7 + keywordScore(b) * 10 * 0.3;
-    return scoreB - scoreA;
-  });
-  const third = Math.ceil(sorted.length / 3);
+
+  // Клипы с совпадением по priorityKeywords пинятся в начало пула —
+  // иначе они тонут в нижних третях из-за низкого aesthetic score.
+  const pinned = videos.filter(hasKeyword);
+  const rest = videos.filter((v) => !hasKeyword(v));
+
+  const sortByScore = (arr: VideoInfo[]) =>
+    [...arr].sort((a, b) => {
+      const scoreA = (a.aestheticScore ?? 0) * 0.7 + keywordScore(a) * 10 * 0.3;
+      const scoreB = (b.aestheticScore ?? 0) * 0.7 + keywordScore(b) * 10 * 0.3;
+      return scoreB - scoreA;
+    });
+
+  const sortedPinned = sortByScore(pinned);
+  const sortedRest = sortByScore(rest);
+  const third = Math.ceil(sortedRest.length / 3);
+
   return [
-    ...shuffle(sorted.slice(0, third)),
-    ...shuffle(sorted.slice(third, third * 2)),
-    ...shuffle(sorted.slice(third * 2)),
+    ...shuffle(sortedPinned), // keyword-клипы всегда первые
+    ...shuffle(sortedRest.slice(0, third)),
+    ...shuffle(sortedRest.slice(third, third * 2)),
+    ...shuffle(sortedRest.slice(third * 2)),
   ];
 }
 
@@ -74,11 +90,7 @@ export interface PromptAnalysis {
 }
 
 /** Результат прямого геокодинга топонима. */
-export interface GeoLocation {
-  name: string;
-  lat: number;
-  lon: number;
-}
+export type GeoLocation = GeocodedLocation;
 
 // ─── Гео-математика ───────────────────────────────────────────────────────────
 
@@ -113,7 +125,7 @@ function minDistKm(video: VideoInfo, targets: GeoLocation[]): number | null {
  * Извлекает всё: дату, топонимы, стиль, ключевые слова.
  * currentDate нужен для интерпретации "прошлогодний", "этим летом" и т.д.
  */
-const TEXT_MODEL = "qwen3-coder:latest";
+const TEXT_MODEL = DEFAULT_TEXT_MODEL;
 
 export async function analyzePrompt(
   prompt: string,
@@ -157,8 +169,8 @@ Rules:
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 290_000);
-    const res = await fetch("http://localhost:11434/api/generate", {
+    const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -166,7 +178,7 @@ Rules:
         prompt: systemPrompt,
         format: "json",
         stream: false,
-        keep_alive: "20m",
+        keep_alive: LLM_KEEP_ALIVE,
       }),
       signal: controller.signal,
     }).finally(() => clearTimeout(timeout));
@@ -197,38 +209,8 @@ Rules:
   };
 }
 
-// ─── Геокодинг ────────────────────────────────────────────────────────────────
-
-/**
- * Прямой геокодинг топонимов через Nominatim (OpenStreetMap).
- * Знает и "Мульта", и "Мультинские озёра", и любые другие географические объекты.
- */
-export async function geocodeLocationNames(
-  names: string[],
-): Promise<GeoLocation[]> {
-  const results: GeoLocation[] = [];
-  for (const name of names) {
-    try {
-      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(name)}&format=json&limit=1&accept-language=ru,en`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "automounter-video-editor/1.0" },
-      });
-      if (res.ok) {
-        const data: any[] = await res.json();
-        if (data[0]) {
-          results.push({
-            name,
-            lat: parseFloat(data[0].lat),
-            lon: parseFloat(data[0].lon),
-          });
-        }
-      }
-    } catch {}
-    // Nominatim policy: не более 1 запроса в секунду
-    if (names.length > 1) await new Promise((r) => setTimeout(r, 1100));
-  }
-  return results;
-}
+// ─── Геокодинг (реэкспорт из services/geocoding) ─────────────────────────────
+export { geocodeLocationNames };
 
 // ─── Пре-фильтрация (до индексации) ──────────────────────────────────────────
 
@@ -276,7 +258,6 @@ export function preFilterByPrompt(
   }
 
   // Шаг 2: GPS-ближайшие (широкий радиус 300 км для пре-фильтра)
-  const PREFILTER_KM = 300;
   const nearbyIds = new Set(
     pool
       .filter(
@@ -298,7 +279,6 @@ export function preFilterByPrompt(
 
   // Шаг 3: "Trip mode" — GPS важнее даты из LLM.
   // Ищем on-location файлы во ВСЕЙ библиотеке, дата LLM — подсказка, не фильтр.
-  const ON_LOCATION_KM = 50;
   const allOnLocation = files.filter(
     (f) =>
       f.lat != null &&
@@ -375,9 +355,13 @@ function calculateClipRelevance(
   // Штраф за повторное использование
   if (usedCount > 0) score -= 10.0 * usedCount;
 
-  // Приоритетные ключевые слова
-  for (const kw of analysis.priorityKeywords)
-    if (text.includes(kw.toLowerCase())) score += 4.0;
+  // Приоритетные ключевые слова.
+  // Бонус нормализован: ANY совпадение даёт +8, каждое доп. совпадение +1 (cap 3).
+  // Без нормализации природный клип с 8 совпадениями бил бы клип с машиной с 2.
+  if (analysis.priorityKeywords.length > 0) {
+    const matches = analysis.priorityKeywords.filter((k) => text.includes(k.toLowerCase())).length;
+    if (matches > 0) score += 8.0 + Math.min(matches - 1, 3) * 1.0;
+  }
 
   // Стиль
   if (analysis.style === "fast-paced")
@@ -470,6 +454,7 @@ function buildAutoInstructions(
     const segDuration = effectiveEnd - t1;
     if (accumulatedSecs + segDuration > targetDurationSeconds + 2) break;
 
+    const excludeKws = analysis.excludeKeywords.map((k) => k.toLowerCase());
     let chosen: VideoInfo | undefined;
     let bestScore = -Infinity;
     for (const candidate of pool) {
@@ -477,6 +462,11 @@ function buildAutoInstructions(
       const maxUses = Math.max(2, (candidate.bestSegments?.length ?? 0) || candidate.validZones.length);
       if (uses >= maxUses) continue;
       if (recentIds.includes(candidate.id) && pool.length > 3) continue;
+      // Жёсткое исключение — независимо от scoring
+      if (excludeKws.length > 0) {
+        const text = ((candidate.tags?.join(" ") ?? "") + " " + (candidate.description ?? "")).toLowerCase();
+        if (excludeKws.some((k) => text.includes(k))) continue;
+      }
       const score = calculateClipRelevance(
         candidate,
         analysis,
@@ -510,56 +500,73 @@ async function filterByContentAI(
 ): Promise<VideoInfo[]> {
   if (videos.length <= 15) return videos;
 
-  // Топ-60 по aesthetic score, разбиваем на батчи по 10 и отправляем параллельно
   const candidates = [...videos]
-    .sort((a, b) => (b.aestheticScore ?? 0) - (a.aestheticScore ?? 0))
-    .slice(0, 60);
+    .sort((a, b) => (b.aestheticScore ?? 0) - (a.aestheticScore ?? 0));
 
-  const requestDesc = [
-    analysis.priorityKeywords.slice(0, 10).join(", "),
-    analysis.excludeKeywords.length ? `EXCLUDE: ${analysis.excludeKeywords.slice(0, 5).join(", ")}` : "",
-    analysis.locationNames.length ? `location: ${analysis.locationNames.join(", ")}` : "",
-  ].filter(Boolean).join(". ");
+  const includeDesc = analysis.priorityKeywords.length
+    ? `KEEP clips that match ANY of these topics: ${analysis.priorityKeywords.join(", ")}`
+    : "";
+  const excludeDesc = analysis.excludeKeywords.length
+    ? `REJECT clips containing ANY of: ${analysis.excludeKeywords.join(", ")}`
+    : "";
+  const locationDesc = analysis.locationNames.length
+    ? `Location context: ${analysis.locationNames.join(", ")}`
+    : "";
 
-  // Ollama обрабатывает запросы последовательно — батчи идут один за другим.
-  // Оптимизация: компактный формат строки (меньше токенов = быстрее генерация).
-  const BATCH_SIZE = 10;
+  const BATCH_SIZE = 15;
   const batches: VideoInfo[][] = [];
   for (let i = 0; i < candidates.length; i += BATCH_SIZE)
     batches.push(candidates.slice(i, i + BATCH_SIZE));
 
-  const filterBatch = async (batch: VideoInfo[]): Promise<string[]> => {
-    // Сверхкомпактный формат: id:tag1,tag2|desc (экономим ~50% токенов)
-    const lines = batch.map((v) => {
-      const tags = (v.tags ?? []).slice(0, 4).join(",");
-      const desc = (v.description ?? "").slice(0, 50);
-      return `${v.id}:${tags}|${desc}`;
-    });
-    const prompt = `Match:"${requestDesc}"\nKeep relevant, reject excluded.\n${lines.join("\n")}\nJSON:{"keep":["id",...]}`;
+  console.log(`AI content filter: ${candidates.length} clips in ${batches.length} batches of ${BATCH_SIZE}`);
 
+  const filterBatch = async (batch: VideoInfo[], batchIdx: number): Promise<string[]> => {
+    const lines = batch.map((v) => {
+      const tags = (v.tags ?? []).slice(0, 8).join(", ");
+      const desc = (v.description ?? "").slice(0, 120);
+      return `ID: ${v.id}\n  tags: ${tags}\n  desc: ${desc}`;
+    });
+    const prompt = [
+      "You are a video clip filter. Review each clip and decide whether to keep it.",
+      includeDesc,
+      excludeDesc,
+      locationDesc,
+      excludeDesc ? "Be strict about exclusions: if a clip's tags or description mention any excluded content — reject it." : "",
+      includeDesc ? "Keep a clip if it matches ANY one topic from the keep list — not all topics are required in one clip." : "",
+      "",
+      "CLIPS:",
+      lines.join("\n"),
+      "",
+      'Respond ONLY with JSON: {"keep":["id1","id2",...]}',
+    ].filter(Boolean).join("\n");
+
+    console.log(`  Content filter batch ${batchIdx + 1}/${batches.length} (${batch.length} clips)...`);
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 60_000);
-      const res = await fetch("http://localhost:11434/api/generate", {
+      const timer = setTimeout(() => ctrl.abort(), 120_000);
+      const res = await fetch(`${OLLAMA_URL}/api/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: TEXT_MODEL, prompt, format: "json", stream: false, keep_alive: "20m",
-          options: { num_predict: 128, temperature: 0.1 } }),
+        body: JSON.stringify({ model: TEXT_MODEL, prompt, format: "json", stream: false, keep_alive: LLM_KEEP_ALIVE,
+          options: { temperature: 0.1 } }),
         signal: ctrl.signal,
       }).finally(() => clearTimeout(timer));
       if (!res.ok) return batch.map((v) => v.id);
       const data: any = await res.json();
       const parsed = JSON.parse(cleanJSONString(data.response));
-      return Array.isArray(parsed.keep) ? parsed.keep.filter((id: any) => typeof id === "string") : batch.map((v) => v.id);
+      const kept = Array.isArray(parsed.keep) ? parsed.keep.filter((id: any) => typeof id === "string") : batch.map((v) => v.id);
+      console.log(`  Batch ${batchIdx + 1} done: ${kept.length}/${batch.length} kept`);
+      return kept;
     } catch {
+      console.log(`  Batch ${batchIdx + 1} failed/timeout, keeping all`);
       return batch.map((v) => v.id);
     }
   };
 
   try {
     const allKept: string[] = [];
-    for (const batch of batches) {
-      const kept = await filterBatch(batch);
+    for (let bi = 0; bi < batches.length; bi++) {
+      const kept = await filterBatch(batches[bi]!, bi);
       allKept.push(...kept);
     }
     const keptSet = new Set(allKept);
@@ -567,13 +574,8 @@ async function filterByContentAI(
 
     if (approved.length < 5) return videos;
 
-    const nonCandidates = videos.filter((v) => !candidates.some((c) => c.id === v.id));
-    const supplemented = approved.length >= 20
-      ? approved
-      : [...approved, ...nonCandidates.slice(0, 30 - approved.length)];
-
-    console.log(`AI content filter: ${approved.length}/${candidates.length} clips kept (of ${videos.length} total)`);
-    return supplemented;
+    console.log(`AI content filter: ${approved.length}/${candidates.length} clips kept`);
+    return approved;
   } catch {
     return videos;
   }
@@ -587,16 +589,14 @@ async function buildLLMInstructions(
   audioAnalysis: AudioAnalysis,
   targetDurationSeconds: number,
 ): Promise<AIEditInstruction[] | null> {
-  // Топ-30 по скорингу + shuffle — вдвое меньше токенов в промпте → быстрее prefill
-  const scored = shuffledPool(videos, analysis.priorityKeywords).slice(0, 30);
-  // Компактный формат: shortName вместо полного ID (экономия ~20 символов на строку)
+  const scored = shuffledPool(videos, analysis.priorityKeywords).slice(0, 50);
   const clipLines = scored.map((v) => {
     const zoneCount = v.bestSegments?.length || v.validZones.length;
     const shortName = path.basename(v.filePath).replace(/^DJI_\d+_(\d+)_D\.MP4$/i, "DJI_$1").slice(0, 16);
-    const tags = (v.tags ?? []).slice(0, 4).join(",");
+    const tags = (v.tags ?? []).slice(0, 8).join(", ");
     const loc = v.location?.address ? ` [${v.location.address.split(",")[0]}]` : "";
     const sm = v.isSlowMotionSuitable ? "~" : "";
-    return `${shortName} ${tags} ${v.duration.toFixed(0)}s sc:${(v.aestheticScore ?? 0).toFixed(1)} m:${(v.motionIntensity ?? 0.5).toFixed(2)} z:${zoneCount}${sm}${loc}`;
+    return `${shortName} | ${tags} | ${v.duration.toFixed(0)}s sc:${(v.aestheticScore ?? 0).toFixed(1)} m:${(v.motionIntensity ?? 0.5).toFixed(2)} z:${zoneCount}${sm}${loc}`;
   });
 
   const windowSize = 15;
@@ -611,35 +611,57 @@ async function buildLLMInstructions(
     ? (audioAnalysis.beats[audioAnalysis.beats.length - 1]! - audioAnalysis.beats[0]!) / audioAnalysis.beats.length
     : 0.5;
 
+  const excludeBlock = analysis.excludeKeywords.length
+    ? `EXCLUDE (never select clips containing these): ${analysis.excludeKeywords.join(", ")}`
+    : "";
+
+  // Разделяем keywords на "специфические" (редкие объекты — машина, лодка и т.д.)
+  // и "тематические" (природа, пейзаж и т.д.). Специфические требуют явного присутствия.
+  const specificSubjects = analysis.priorityKeywords.filter((k) => {
+    const specific = ["car", "vehicle", "suv", "truck", "boat", "bike", "motorcycle",
+      "horse", "aircraft", "helicopter", "train", "bus", "машина", "автомобиль", "мотоцикл"];
+    return specific.some((s) => k.toLowerCase().includes(s));
+  });
+  const includeBlock = analysis.priorityKeywords.length
+    ? `PRIORITY SUBJECTS (prefer clips with any of these): ${analysis.priorityKeywords.join(", ")}`
+    : "";
+  const guaranteeBlock = specificSubjects.length
+    ? `REQUIRED SUBJECTS (you MUST include multiple clips featuring these — they are explicitly requested): ${specificSubjects.join(", ")}`
+    : "";
+
   const prompt = `You are a professional video editor. Create a ${analysis.style} music video edit plan.
 The clips below are in RANDOM order — you must deliberately reorder them to build a narrative arc.
 
 TARGET: ${targetDurationSeconds}s total. Beat ≈ ${avgBeatSec.toFixed(2)}s each.
-KEYWORDS: ${analysis.priorityKeywords.slice(0, 6).join(", ") || "none"}
+${includeBlock}
+${guaranteeBlock}
+${excludeBlock}
 
 AUDIO ENERGY PROFILE (place clips accordingly):
 ${audioParts.join("\n")}
 
-CLIPS (id shortname tags dur sc:score m:motion z:zones ~ =slowmo):
+CLIPS (shortname | tags | dur score motion zones ~ =slowmo):
 ${clipLines.join("\n")}
 
 RULES:
 - Select the best clips and arrange them for a narrative arc: calm opening → build-up → climax → resolution.
+- ${excludeBlock ? "NEVER select clips with tags/description matching EXCLUDE list." : ""}
+- ${guaranteeBlock ? "REQUIRED SUBJECTS must appear multiple times — scan the clip list and explicitly pick all clips matching these subjects." : ""}
 - A clip with z:N zones can appear up to N times (different parts each time).
 - Prefer clips with high score. Use slowmo (~) clips near energy peaks.
-- Return enough clip IDs to fill ${targetDurationSeconds}s. Estimate ~${Math.max(2, avgBeatSec * 4).toFixed(1)}s per clip → need ~${Math.ceil(targetDurationSeconds / Math.max(2, avgBeatSec * 4))} clips. Clips with z>1 can repeat. Max ${Math.min(scored.length * 2, 40)} IDs.
+- Return enough clip IDs to fill ${targetDurationSeconds}s. Estimate ~${Math.max(2, avgBeatSec * 4).toFixed(1)}s per clip → need ~${Math.ceil(targetDurationSeconds / Math.max(2, avgBeatSec * 4))} clips. Clips with z>1 can repeat. Max ${Math.min(scored.length * 2, 50)} IDs.
 
 Respond ONLY with JSON: {"s":["id1","id2","id3",...]}
 `;
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 290_000);
-    const res = await fetch("http://localhost:11434/api/generate", {
+    const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: TEXT_MODEL, prompt, format: "json", stream: false, keep_alive: "20m",
-        options: { num_predict: 512, temperature: 0.3 } }),
+      body: JSON.stringify({ model: TEXT_MODEL, prompt, format: "json", stream: false, keep_alive: LLM_KEEP_ALIVE,
+        options: { temperature: 0.3 } }),
       signal: controller.signal,
     }).finally(() => clearTimeout(timeout));
 
@@ -667,6 +689,7 @@ Respond ONLY with JSON: {"s":["id1","id2","id3",...]}
     const maxClips = Math.min(40, Math.ceil(targetDurationSeconds / Math.max(2, avgBeatSec * 4)) + 5);
     const cappedIds = orderedIds.slice(0, maxClips);
     console.log(`LLM director phase 1: ordered ${cappedIds.length} clips`);
+    console.log(`LLM director phase 2: assigning effects...`);
 
     // ── Фаза 2: эффекты для выбранных клипов ─────────────────────────────────
     // Оцениваем позицию каждого клипа в таймлайне (приблизительно, 4 бита = avgBeatSec*4)
@@ -702,11 +725,11 @@ RULES (be specific per clip, not generic):
 Respond ONLY with JSON: {"s":[{"i":"id","z":"none","e":"none","x":"none","sp":1.0,"t":"hard","n":"start"},...]}`;
 
     const ctrl2 = new AbortController();
-    const t2 = setTimeout(() => ctrl2.abort(), 290_000);
-    const res2 = await fetch("http://localhost:11434/api/generate", {
+    const t2 = setTimeout(() => ctrl2.abort(), LLM_TIMEOUT_MS);
+    const res2 = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: TEXT_MODEL, prompt: effectPrompt, format: "json", stream: false, keep_alive: "20m",
+      body: JSON.stringify({ model: TEXT_MODEL, prompt: effectPrompt, format: "json", stream: false, keep_alive: LLM_KEEP_ALIVE,
         options: { temperature: 0.3 } }),
       signal: ctrl2.signal,
     }).finally(() => clearTimeout(t2));
@@ -885,6 +908,7 @@ export async function createDirectorPlan(
   const needsAiFilter = analysis.excludeKeywords.length > 0 ||
     preEffective.length > 80 ||
     (analysis.priorityKeywords.length === 0 && preEffective.length > 15);
+  if (!needsAiFilter) console.log(`AI content filter: skipped (${preEffective.length} clips, no exclude keywords)`);
   const aiFiltered = needsAiFilter
     ? await filterByContentAI(preEffective, analysis)
     : preEffective;
@@ -1067,6 +1091,7 @@ export async function createDirectorPlan(
     accumulated += targetDur;
     beatIdx += chunkSize;
   }
+  console.log(`Visual dedup: checking ${segments.length} segments...`);
   const deduped = await deduplicateSegments(segments);
 
   if (deduped.length > 0) {

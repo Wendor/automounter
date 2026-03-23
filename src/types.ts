@@ -29,6 +29,8 @@ export interface AudioAnalysis {
   sections: AudioSection[]; // 2-second windowed breakdown
 }
 
+export type Orientation = "horizontal" | "vertical";
+
 export type ZoomEffect = "zoomIn" | "zoomOut" | "none";
 export type EntryEffect = "fadeIn" | "flashIn" | "none";
 export type ExitEffect = "fadeOut" | "flashOut" | "none";
@@ -150,4 +152,5 @@ export interface RenderSession {
   targetFps: number;
   audio: string;
   renderedAt: string;
+  orientation?: Orientation;
 }

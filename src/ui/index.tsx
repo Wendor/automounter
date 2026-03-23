@@ -28,7 +28,7 @@ export const THEME = {
 
 let activeRenderer: any = null;
 
-function cleanupTerminal() {
+export function cleanupTerminal() {
   if (activeRenderer) {
     try {
       activeRenderer.destroy();
@@ -43,20 +43,6 @@ function cleanupTerminal() {
     process.stdin.pause();
   }
 }
-
-process.on("SIGINT", () => {
-  cleanupTerminal();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  cleanupTerminal();
-  process.exit(0);
-});
-process.on("uncaughtException", (e) => {
-  cleanupTerminal();
-  console.error(e);
-  process.exit(1);
-});
 
 interface MenuProps {
   hasSession: boolean;

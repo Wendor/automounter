@@ -150,6 +150,7 @@ export async function promptSetup(saved: Partial<Config>): Promise<Config> {
     output: output || path.join(process.cwd(), "final_edit.mp4"),
     model: model || "llava:13b",
     quality: saved.quality ?? "medium",
+    orientation: saved.orientation ?? "horizontal",
   };
 
   // Summary
