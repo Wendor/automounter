@@ -36,37 +36,44 @@ function shuffle<T>(arr: T[]): T[] {
   return a;
 }
 
-function shuffledPool(videos: VideoInfo[], keywords: string[] = []): VideoInfo[] {
-  const kws = keywords.map((k) => k.toLowerCase());
-  const hasKeyword = (v: VideoInfo): boolean => {
-    if (kws.length === 0) return false;
-    const text = ((v.tags?.join(" ") ?? "") + " " + (v.description ?? "")).toLowerCase();
-    return kws.some((k) => text.includes(k));
-  };
-  const keywordScore = (v: VideoInfo): number => {
-    if (kws.length === 0) return 0;
-    const text = ((v.tags?.join(" ") ?? "") + " " + (v.description ?? "")).toLowerCase();
-    return kws.filter((k) => text.includes(k)).length / kws.length;
-  };
+/**
+ * Возвращает клипы в порядке убывания приоритета:
+ * 1. Клипы с requiredKeywords (обязательные объекты из промпта) — первыми.
+ * 2. Клипы с allKeywords (тематические ключевые слова) — вторыми.
+ * 3. Остальные — в хвосте.
+ * Внутри каждой группы сортировка по aestheticScore + перемешивание.
+ */
+function shuffledPool(
+  videos: VideoInfo[],
+  allKeywords: string[] = [],
+  requiredKeywords: string[] = [],
+): VideoInfo[] {
+  const kws = allKeywords.map((k) => k.toLowerCase());
+  const reqKws = requiredKeywords.map((k) => k.toLowerCase());
 
-  // Клипы с совпадением по priorityKeywords пинятся в начало пула —
-  // иначе они тонут в нижних третях из-за низкого aesthetic score.
-  const pinned = videos.filter(hasKeyword);
-  const rest = videos.filter((v) => !hasKeyword(v));
+  const textOf = (v: VideoInfo) =>
+    ((v.tags?.join(" ") ?? "") + " " + (v.description ?? "")).toLowerCase();
 
-  const sortByScore = (arr: VideoInfo[]) =>
-    [...arr].sort((a, b) => {
-      const scoreA = (a.aestheticScore ?? 0) * 0.7 + keywordScore(a) * 10 * 0.3;
-      const scoreB = (b.aestheticScore ?? 0) * 0.7 + keywordScore(b) * 10 * 0.3;
-      return scoreB - scoreA;
-    });
+  const matchesRequired = (v: VideoInfo) =>
+    reqKws.length > 0 && reqKws.some((k) => textOf(v).includes(k));
 
-  const sortedPinned = sortByScore(pinned);
-  const sortedRest = sortByScore(rest);
+  const matchesGeneral = (v: VideoInfo) =>
+    kws.length > 0 && kws.some((k) => textOf(v).includes(k));
+
+  const sortByAesthetic = (arr: VideoInfo[]) =>
+    [...arr].sort((a, b) => (b.aestheticScore ?? 0) - (a.aestheticScore ?? 0));
+
+  // Три уровня: обязательные объекты → тематические → остальные
+  const required = videos.filter(matchesRequired);
+  const general = videos.filter((v) => !matchesRequired(v) && matchesGeneral(v));
+  const rest = videos.filter((v) => !matchesRequired(v) && !matchesGeneral(v));
+
+  const sortedRest = sortByAesthetic(rest);
   const third = Math.ceil(sortedRest.length / 3);
 
   return [
-    ...shuffle(sortedPinned), // keyword-клипы всегда первые
+    ...shuffle(sortByAesthetic(required)), // обязательные объекты — всегда первые
+    ...shuffle(sortByAesthetic(general)),  // затем тематические клипы
     ...shuffle(sortedRest.slice(0, third)),
     ...shuffle(sortedRest.slice(third, third * 2)),
     ...shuffle(sortedRest.slice(third * 2)),
@@ -74,6 +81,13 @@ function shuffledPool(videos: VideoInfo[], keywords: string[] = []): VideoInfo[]
 }
 
 // ─── Публичные типы ───────────────────────────────────────────────────────────
+
+/** Тема из промпта пользователя с тегами библиотеки */
+export interface PromptTopic {
+  name: string;        // название темы (язык пользователя), e.g. "машина", "природа"
+  keywords: string[];  // английские теги библиотеки, соответствующие теме
+  required: boolean;   // true = явно обязательно ("с X", "with X", "featuring")
+}
 
 /**
  * Результат анализа промпта одним вызовом LLM.
@@ -85,7 +99,9 @@ export interface PromptAnalysis {
   locationNames: string[];        // топонимы из промпта (оригинальный регистр)
   includeTravel: boolean;         // включать дорогу до/от места
   style: "cinematic" | "fast-paced" | "calm" | "vlog";
-  priorityKeywords: string[];     // теги для повышения приоритета
+  topics: PromptTopic[];          // темы пользователя (основа для ранжирования)
+  priorityKeywords: string[];     // производное: все теги всех тем
+  requiredElements: string[];     // производное: теги обязательных тем
   excludeKeywords: string[];      // теги для исключения
 }
 
@@ -127,6 +143,65 @@ function minDistKm(video: VideoInfo, targets: GeoLocation[]): number | null {
  */
 const TEXT_MODEL = DEFAULT_TEXT_MODEL;
 
+const TAG_BATCH_SIZE = 400;
+
+/**
+ * Классифицирует батч тегов по темам пользователя.
+ * Возвращает: для каждой темы — какие теги из батча к ней относятся; + exclude.
+ */
+async function classifyTagBatch(
+  prompt: string,
+  topics: PromptTopic[],
+  tags: string[],
+  batchIdx: number,
+  totalBatches: number,
+): Promise<{ topicTags: Record<string, string[]>; exclude: string[] }> {
+  const empty = { topicTags: {}, exclude: [] };
+  const topicList = topics.map((t) => `"${t.name}"${t.required ? " (required)" : ""}`).join(", ");
+  const p = `User request: "${prompt}"
+User topics: ${topicList}
+
+Library tags batch ${batchIdx + 1}/${totalBatches}:
+${tags.join(", ")}
+
+For each tag, assign it to ONE topic name (exact match from the list above) if it visually matches that topic.
+Mark as "exclude" if the user explicitly does NOT want this content.
+Omit tags that don't clearly match any topic.
+
+Return ONLY JSON: {"topics":{"topic_name":["tag1","tag2"]},"exclude":[]}`;
+  console.log(`  Tag batch ${batchIdx + 1}/${totalBatches} (${tags.length} tags)...`);
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), LLM_TIMEOUT_MS);
+    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: TEXT_MODEL, prompt: p, format: "json", stream: false, keep_alive: LLM_KEEP_ALIVE }),
+      signal: ctrl.signal,
+    }).finally(() => clearTimeout(timer));
+    if (!res.ok) { console.log(`  Tag batch ${batchIdx + 1} HTTP error ${res.status}`); return empty; }
+    const data: any = await res.json();
+    const parsed = JSON.parse(cleanJSONString(data.response));
+    const tagSet = new Set(tags);
+    const topicNames = new Set(topics.map((t) => t.name));
+    const topicTags: Record<string, string[]> = {};
+    if (parsed.topics && typeof parsed.topics === "object") {
+      for (const [name, arr] of Object.entries(parsed.topics)) {
+        if (!topicNames.has(name)) continue;
+        const clean = Array.isArray(arr) ? arr.filter((t: any) => typeof t === "string" && tagSet.has(t)) : [];
+        if (clean.length > 0) topicTags[name] = clean;
+      }
+    }
+    const exclude = Array.isArray(parsed.exclude) ? parsed.exclude.filter((t: any) => typeof t === "string" && tagSet.has(t)) : [];
+    const total = Object.values(topicTags).reduce((s, a) => s + a.length, 0);
+    console.log(`  Tag batch ${batchIdx + 1} done: ${total} topic tags, ${exclude.length} exclude`);
+    return { topicTags, exclude };
+  } catch (e) {
+    console.log(`  Tag batch ${batchIdx + 1} failed: ${e instanceof Error ? e.message : String(e)}`);
+    return empty;
+  }
+}
+
 export async function analyzePrompt(
   prompt: string,
   currentDate: string,
@@ -135,14 +210,13 @@ export async function analyzePrompt(
 ): Promise<PromptAnalysis> {
   const year = new Date(currentDate).getFullYear();
   const prev = year - 1;
-  const tagsBlock = availableTags.length > 0
-    ? `\nLibrary tags (use as reference — prefer these exact strings when they match, but also add synonyms):\n${availableTags.join(", ")}\n`
-    : "";
+
+  // Вызов 1: только структурный анализ промпта (без тегов — быстро)
   const systemPrompt = `Today is ${currentDate}.
-Analyze this video editing request and extract search parameters.
+Analyze this video editing request.
 
 User request: "${prompt}"
-${tagsBlock}
+
 Respond ONLY with valid JSON:
 {
   "dateStart": "YYYY-MM-DD or null",
@@ -150,63 +224,95 @@ Respond ONLY with valid JSON:
   "locationNames": [],
   "includeTravel": false,
   "style": "cinematic",
-  "priorityKeywords": [],
+  "topics": [{"name": "...", "keywords": [], "required": false}],
   "excludeKeywords": []
 }
 
 Rules:
-- dateStart/dateEnd: extract time range ONLY if the request explicitly mentions a time period. If no time is mentioned → both must be null. Do NOT default to today or current year.
-  Year hints when time IS mentioned: "прошлый/прошлогодний" = ${prev}, "этот год" = ${year}.
-  Season mapping (replace Y with the resolved year):
-    summer/лето=Y-06-01..Y-08-31, early summer=Y-06-01..Y-06-30, mid summer=Y-07-01..Y-07-31, late summer/конец лета=Y-08-01..Y-08-31,
-    autumn/осень=Y-09-01..Y-11-30, winter/зима=Y-12-01..(Y+1)-02-28, spring/весна=Y-03-01..Y-05-31.
-  Combine: "прошлогодний" + "конец лета" → ${prev}-08-01 .. ${prev}-08-31.
-- locationNames: ONLY named places explicitly mentioned in the request (rivers, mountains, cities, regions by name). Do NOT include generic landscape/content words (road, forest, mountain, car, river, highway, city) — those go into priorityKeywords. Do NOT include temporal words. Keep original spelling from the request.
+- dateStart/dateEnd: extract time range ONLY if the request explicitly mentions a time period. Both null if no time mentioned.
+  Year hints: "прошлый/прошлогодний" = ${prev}, "этот год" = ${year}.
+  Seasons: summer/лето=Y-06-01..Y-08-31, autumn/осень=Y-09-01..Y-11-30, winter/зима=Y-12-01..(Y+1)-02-28, spring/весна=Y-03-01..Y-05-31.
+- locationNames: ONLY named places explicitly mentioned. Keep original spelling.
 - includeTravel: true if request implies travel (поездка, путешествие, ехали, дорога, trip).
-- style: cinematic (default) | fast-paced | calm | vlog.
-- priorityKeywords: extract ALL specific subjects/objects mentioned — include EVERY subject even if multiple are listed (e.g. "природа и автомобиль" → include both nature tags AND car tags). Do NOT include: style/mood words (epic, cinematic), overly generic words (road, sky, field, water). First pick matching tags from the library list above, then expand with synonyms. Example: "природа с автомобилем" → ["car","vehicle","suv","automobile","nature","wildlife","landscape","mountain","forest"]. Always English only.
-- excludeKeywords: content to exclude — be exhaustive with synonyms. Example: "без людей" → ["people","person","man","woman","child","crowd","tourist","pedestrian","human","figure","silhouette","hiker","walker","group","couple"]. Match library tags first, then add all plausible variants in English.`;
+- style: cinematic | fast-paced | calm | vlog.
+- topics: list of distinct visual subjects/themes the user wants in the video. Each topic:
+  - name: short label in the user's language (e.g. "природа", "машина")
+  - keywords: 3-8 English synonyms for library tag search (broad, visual terms only)
+  - required: true ONLY if explicitly required ("с X", "with X", "featuring", "включая", "в кадре")
+  Do NOT include style/mood/location as topics. Keep topics distinct.
+- excludeKeywords: content to EXCLUDE — exhaustive English synonyms. Example "без людей" → ["people","person","man","woman","child","crowd","tourist","pedestrian","human","figure","silhouette","hiker"].`;
+
+  const base: PromptAnalysis = {
+    dateStart: null, dateEnd: null, locationNames: [],
+    includeTravel: false, style: "cinematic",
+    topics: [], priorityKeywords: [], requiredElements: [], excludeKeywords: [],
+  };
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    console.log(`  Prompt analysis (structural)...`);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), LLM_TIMEOUT_MS);
     const res = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: TEXT_MODEL,
-        prompt: systemPrompt,
-        format: "json",
-        stream: false,
-        keep_alive: LLM_KEEP_ALIVE,
-      }),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
+      body: JSON.stringify({ model: TEXT_MODEL, prompt: systemPrompt, format: "json", stream: false, keep_alive: LLM_KEEP_ALIVE }),
+      signal: ctrl.signal,
+    }).finally(() => clearTimeout(timer));
+
     if (res.ok) {
       const data: any = await res.json();
       const parsed = JSON.parse(cleanJSONString(data.response));
       const promptLower = prompt.toLowerCase();
-      const rawLocations: string[] = Array.isArray(parsed.locationNames) ? parsed.locationNames : [];
-      // Keep only location names that actually appear in the user's prompt (anti-hallucination)
-      const filteredLocations = rawLocations.filter(loc =>
-        promptLower.includes(loc.toLowerCase())
-      );
-      return {
-        dateStart: parsed.dateStart ?? null,
-        dateEnd: parsed.dateEnd ?? null,
-        locationNames: filteredLocations,
-        includeTravel: parsed.includeTravel ?? false,
-        style: parsed.style ?? "cinematic",
-        priorityKeywords: Array.isArray(parsed.priorityKeywords) ? parsed.priorityKeywords : [],
-        excludeKeywords: Array.isArray(parsed.excludeKeywords) ? parsed.excludeKeywords : [],
-      };
+      base.dateStart = parsed.dateStart ?? null;
+      base.dateEnd = parsed.dateEnd ?? null;
+      base.locationNames = (Array.isArray(parsed.locationNames) ? parsed.locationNames : [] as string[])
+        .filter((loc: string) => promptLower.includes(loc.toLowerCase()));
+      base.includeTravel = parsed.includeTravel ?? false;
+      base.style = parsed.style ?? "cinematic";
+      base.excludeKeywords = Array.isArray(parsed.excludeKeywords) ? parsed.excludeKeywords : [];
+      // Парсим темы
+      if (Array.isArray(parsed.topics)) {
+        base.topics = parsed.topics
+          .filter((t: any) => t && typeof t.name === "string")
+          .map((t: any) => ({
+            name: String(t.name),
+            keywords: Array.isArray(t.keywords) ? t.keywords.filter((k: any) => typeof k === "string") : [],
+            required: Boolean(t.required),
+          }));
+      }
+      const topicSummary = base.topics.map((t) => `${t.name}${t.required ? "!" : ""}(${t.keywords.slice(0,3).join(",")})`).join(", ");
+      console.log(`  Structural: style=${base.style} topics=[${topicSummary}] exclude=[${base.excludeKeywords.slice(0,4).join(",")}...]`);
     }
-  } catch {}
-  return {
-    dateStart: null, dateEnd: null, locationNames: [],
-    includeTravel: false, style: "cinematic",
-    priorityKeywords: [], excludeKeywords: [],
-  };
+  } catch (e) {
+    console.log(`  Structural analysis failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // Вызов 2+: классификация тегов библиотеки — батчи по TAG_BATCH_SIZE, последовательно
+  if (availableTags.length > 0 && base.topics.length > 0) {
+    const batches: string[][] = [];
+    for (let i = 0; i < availableTags.length; i += TAG_BATCH_SIZE)
+      batches.push(availableTags.slice(i, i + TAG_BATCH_SIZE));
+    console.log(`  Classifying ${availableTags.length} library tags in ${batches.length} batch(es) by ${base.topics.length} topics...`);
+    for (let i = 0; i < batches.length; i++) {
+      const r = await classifyTagBatch(prompt, base.topics, batches[i]!, i, batches.length);
+      // Добавляем теги к соответствующим темам
+      for (const topic of base.topics) {
+        const newTags = r.topicTags[topic.name] ?? [];
+        if (newTags.length > 0) topic.keywords = [...new Set([...topic.keywords, ...newTags])];
+      }
+      base.excludeKeywords.push(...r.exclude);
+    }
+    base.excludeKeywords = [...new Set(base.excludeKeywords)];
+  }
+
+  // Производные поля для обратной совместимости
+  base.priorityKeywords = [...new Set(base.topics.flatMap((t) => t.keywords))];
+  base.requiredElements = [...new Set(base.topics.filter((t) => t.required).flatMap((t) => t.keywords))];
+
+  console.log(`  Topics final: ${base.topics.map((t) => `${t.name}(${t.keywords.length} tags)`).join(", ")}`);
+  console.log(`  priority=${base.priorityKeywords.length} required=${base.requiredElements.length} exclude=${base.excludeKeywords.length}`);
+
+  return base;
 }
 
 // ─── Геокодинг (реэкспорт из services/geocoding) ─────────────────────────────
@@ -355,12 +461,26 @@ function calculateClipRelevance(
   // Штраф за повторное использование
   if (usedCount > 0) score -= 10.0 * usedCount;
 
-  // Приоритетные ключевые слова.
-  // Бонус нормализован: ANY совпадение даёт +8, каждое доп. совпадение +1 (cap 3).
-  // Без нормализации природный клип с 8 совпадениями бил бы клип с машиной с 2.
-  if (analysis.priorityKeywords.length > 0) {
-    const matches = analysis.priorityKeywords.filter((k) => text.includes(k.toLowerCase())).length;
-    if (matches > 0) score += 8.0 + Math.min(matches - 1, 3) * 1.0;
+  // Topic-based scoring:
+  // Первичный критерий — количество тем пользователя, найденных в клипе.
+  // Клип с "природа + машина" > клипа с только "природа".
+  // Обязательные темы (required=true) считаются вдвойне.
+  // Вторичный критерий — частота тегов внутри найденных тем.
+  if (analysis.topics.length > 0) {
+    let topicScore = 0;
+    let kwFrequency = 0;
+    for (const topic of analysis.topics) {
+      const kws = topic.keywords.map((k) => k.toLowerCase());
+      const hits = kws.filter((k) => text.includes(k)).length;
+      if (hits > 0) {
+        topicScore += topic.required ? 2 : 1;  // обязательные темы — вдвойне
+        kwFrequency += Math.min(hits, 3);       // cap 3 per topic
+      }
+    }
+    if (topicScore > 0) {
+      score += topicScore * 12.0;   // каждая тема +12 (обязательная +24)
+      score += kwFrequency * 1.0;   // вторичный критерий: частота тегов
+    }
   }
 
   // Стиль
@@ -416,7 +536,7 @@ function buildAutoInstructions(
 ): AIEditInstruction[] {
   const beats = audioAnalysis.beats;
   const instructions: AIEditInstruction[] = [];
-  const pool = shuffledPool(videos, analysis.priorityKeywords);
+  const pool = shuffledPool(videos, analysis.priorityKeywords, analysis.requiredElements);
   const usedCountMap = new Map<string, number>();
   let beatsUsed = 0;
   let accumulatedSecs = 0;
@@ -492,94 +612,9 @@ function buildAutoInstructions(
   return instructions;
 }
 
-// ─── AI Content Filter ────────────────────────────────────────────────────────
-
-async function filterByContentAI(
-  videos: VideoInfo[],
-  analysis: PromptAnalysis,
-): Promise<VideoInfo[]> {
-  if (videos.length <= 15) return videos;
-
-  const candidates = [...videos]
-    .sort((a, b) => (b.aestheticScore ?? 0) - (a.aestheticScore ?? 0));
-
-  const includeDesc = analysis.priorityKeywords.length
-    ? `KEEP clips that match ANY of these topics: ${analysis.priorityKeywords.join(", ")}`
-    : "";
-  const excludeDesc = analysis.excludeKeywords.length
-    ? `REJECT clips containing ANY of: ${analysis.excludeKeywords.join(", ")}`
-    : "";
-  const locationDesc = analysis.locationNames.length
-    ? `Location context: ${analysis.locationNames.join(", ")}`
-    : "";
-
-  const BATCH_SIZE = 15;
-  const batches: VideoInfo[][] = [];
-  for (let i = 0; i < candidates.length; i += BATCH_SIZE)
-    batches.push(candidates.slice(i, i + BATCH_SIZE));
-
-  console.log(`AI content filter: ${candidates.length} clips in ${batches.length} batches of ${BATCH_SIZE}`);
-
-  const filterBatch = async (batch: VideoInfo[], batchIdx: number): Promise<string[]> => {
-    const lines = batch.map((v) => {
-      const tags = (v.tags ?? []).slice(0, 8).join(", ");
-      const desc = (v.description ?? "").slice(0, 120);
-      return `ID: ${v.id}\n  tags: ${tags}\n  desc: ${desc}`;
-    });
-    const prompt = [
-      "You are a video clip filter. Review each clip and decide whether to keep it.",
-      includeDesc,
-      excludeDesc,
-      locationDesc,
-      excludeDesc ? "Be strict about exclusions: if a clip's tags or description mention any excluded content — reject it." : "",
-      includeDesc ? "Keep a clip if it matches ANY one topic from the keep list — not all topics are required in one clip." : "",
-      "",
-      "CLIPS:",
-      lines.join("\n"),
-      "",
-      'Respond ONLY with JSON: {"keep":["id1","id2",...]}',
-    ].filter(Boolean).join("\n");
-
-    console.log(`  Content filter batch ${batchIdx + 1}/${batches.length} (${batch.length} clips)...`);
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 120_000);
-      const res = await fetch(`${OLLAMA_URL}/api/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: TEXT_MODEL, prompt, format: "json", stream: false, keep_alive: LLM_KEEP_ALIVE,
-          options: { temperature: 0.1 } }),
-        signal: ctrl.signal,
-      }).finally(() => clearTimeout(timer));
-      if (!res.ok) return batch.map((v) => v.id);
-      const data: any = await res.json();
-      const parsed = JSON.parse(cleanJSONString(data.response));
-      const kept = Array.isArray(parsed.keep) ? parsed.keep.filter((id: any) => typeof id === "string") : batch.map((v) => v.id);
-      console.log(`  Batch ${batchIdx + 1} done: ${kept.length}/${batch.length} kept`);
-      return kept;
-    } catch {
-      console.log(`  Batch ${batchIdx + 1} failed/timeout, keeping all`);
-      return batch.map((v) => v.id);
-    }
-  };
-
-  try {
-    const allKept: string[] = [];
-    for (let bi = 0; bi < batches.length; bi++) {
-      const kept = await filterBatch(batches[bi]!, bi);
-      allKept.push(...kept);
-    }
-    const keptSet = new Set(allKept);
-    const approved = candidates.filter((v) => keptSet.has(v.id));
-
-    if (approved.length < 5) return videos;
-
-    console.log(`AI content filter: ${approved.length}/${candidates.length} clips kept`);
-    return approved;
-  } catch {
-    return videos;
-  }
-}
+// filterByContentAI удалён: тег-фильтр (afterExclude в createDirectorPlan)
+// уже исключает нежелательный контент. AI не добавит ничего нового,
+// т.к. description и теги от той же llava.
 
 // ─── LLM Director ─────────────────────────────────────────────────────────────
 
@@ -589,7 +624,22 @@ async function buildLLMInstructions(
   audioAnalysis: AudioAnalysis,
   targetDurationSeconds: number,
 ): Promise<AIEditInstruction[] | null> {
-  const scored = shuffledPool(videos, analysis.priorityKeywords).slice(0, 50);
+  // Балансируем выборку: не более 25% required-клипов, остальное — общий пул.
+  // Иначе LLM видит только машины и не выбирает природу.
+  const reqKwsLower = analysis.requiredElements.map((k) => k.toLowerCase());
+  const textOf = (v: VideoInfo) =>
+    ((v.tags?.join(" ") ?? "") + " " + (v.description ?? "")).toLowerCase();
+  const isRequired = (v: VideoInfo) =>
+    reqKwsLower.length > 0 && reqKwsLower.some((k) => textOf(v).includes(k));
+
+  const allPool = shuffledPool(videos, analysis.priorityKeywords, analysis.requiredElements);
+  const requiredPool = allPool.filter(isRequired);
+  const generalPool = allPool.filter((v) => !isRequired(v));
+
+  const maxRequired = Math.max(3, Math.ceil(50 * 0.25)); // макс 25% = 12-13 клипов
+  const reqSlice = requiredPool.slice(0, maxRequired);
+  const generalSlice = generalPool.slice(0, 50 - reqSlice.length);
+  const scored = shuffle([...reqSlice, ...generalSlice]);
   const clipLines = scored.map((v) => {
     const zoneCount = v.bestSegments?.length || v.validZones.length;
     const shortName = path.basename(v.filePath).replace(/^DJI_\d+_(\d+)_D\.MP4$/i, "DJI_$1").slice(0, 16);
@@ -615,18 +665,14 @@ async function buildLLMInstructions(
     ? `EXCLUDE (never select clips containing these): ${analysis.excludeKeywords.join(", ")}`
     : "";
 
-  // Разделяем keywords на "специфические" (редкие объекты — машина, лодка и т.д.)
-  // и "тематические" (природа, пейзаж и т.д.). Специфические требуют явного присутствия.
-  const specificSubjects = analysis.priorityKeywords.filter((k) => {
-    const specific = ["car", "vehicle", "suv", "truck", "boat", "bike", "motorcycle",
-      "horse", "aircraft", "helicopter", "train", "bus", "машина", "автомобиль", "мотоцикл"];
-    return specific.some((s) => k.toLowerCase().includes(s));
-  });
-  const includeBlock = analysis.priorityKeywords.length
-    ? `PRIORITY SUBJECTS (prefer clips with any of these): ${analysis.priorityKeywords.join(", ")}`
+  // Формируем блоки тем для LLM: обязательные темы — отдельный блок REQUIRED
+  const requiredTopics = analysis.topics.filter((t) => t.required);
+  const optionalTopics = analysis.topics.filter((t) => !t.required);
+  const includeBlock = optionalTopics.length
+    ? `PRIORITY SUBJECTS (prefer clips with any of these): ${optionalTopics.map((t) => t.keywords.join(", ")).join(", ")}`
     : "";
-  const guaranteeBlock = specificSubjects.length
-    ? `REQUIRED SUBJECTS (you MUST include multiple clips featuring these — they are explicitly requested): ${specificSubjects.join(", ")}`
+  const guaranteeBlock = requiredTopics.length
+    ? `REQUIRED SUBJECTS (you MUST include multiple clips featuring these — they are explicitly requested): ${requiredTopics.map((t) => `${t.name}: ${t.keywords.join(", ")}`).join("; ")}`
     : "";
 
   const prompt = `You are a professional video editor. Create a ${analysis.style} music video edit plan.
@@ -903,21 +949,22 @@ export async function createDirectorPlan(
         ? afterExclude
         : withZones;
 
-  // AI content filter: всегда при excludeKeywords (чтобы поймать людей с нестандартными тегами),
-  // или если пул большой, или если нет keyword-фильтра.
-  const needsAiFilter = analysis.excludeKeywords.length > 0 ||
-    preEffective.length > 80 ||
-    (analysis.priorityKeywords.length === 0 && preEffective.length > 15);
-  if (!needsAiFilter) console.log(`AI content filter: skipped (${preEffective.length} clips, no exclude keywords)`);
-  const aiFiltered = needsAiFilter
-    ? await filterByContentAI(preEffective, analysis)
-    : preEffective;
-  const effective = aiFiltered.length >= MIN_VIDEOS ? aiFiltered : preEffective;
+  const effective = preEffective;
 
+  // Диагностика: сколько клипов реально совпадает с requiredElements
+  const reqKwsCheck = analysis.requiredElements.map((k) => k.toLowerCase());
+  const reqMatchCount = reqKwsCheck.length > 0
+    ? effective.filter((v) => reqKwsCheck.some((k) => textOf(v).includes(k))).length
+    : 0;
+
+  const topicSummary = analysis.topics.length > 0
+    ? ` [topics: ${analysis.topics.map((t) => `${t.name}${t.required ? "!" : ""}(${t.keywords.length})`).join(", ")}]`
+    : "";
   console.log(
     `Director: ${effective.length}/${videos.length} clips selected` +
-    (analysis.priorityKeywords.length > 0 ? ` [keywords: ${analysis.priorityKeywords.slice(0, 4).join(", ")}]` : "") +
-    (analysis.excludeKeywords.length > 0 ? ` [exclude: ${analysis.excludeKeywords.slice(0, 4).join(", ")}]` : "") +
+    topicSummary +
+    (analysis.excludeKeywords.length > 0 ? ` [exclude: ${analysis.excludeKeywords.length} (${analysis.excludeKeywords.slice(0, 4).join(", ")}...)]` : "") +
+    (analysis.requiredElements.length > 0 ? ` [required: ${reqMatchCount} clips match]` : "") +
     (analysis.locationNames.length > 0 ? ` [location: ${analysis.locationNames.join(", ")}]` : "")
   );
 
@@ -936,11 +983,52 @@ export async function createDirectorPlan(
 
   // Сначала пробуем LLM-режиссёра, fallback на алгоритм
   const llmPlan = await buildLLMInstructions(effective, analysis, audioAnalysis, targetDurationSeconds);
-  const autoPlan = llmPlan ?? buildAutoInstructions(
+  const plan = llmPlan ?? buildAutoInstructions(
     effective, audioAnalysis, analysis, targets, tripRange, targetDurationSeconds,
   );
   if (llmPlan) console.log("Using LLM director plan");
   else console.log("Using algorithmic director plan (LLM fallback)");
+
+  // ─── Quota enforcement для обязательных объектов (requiredElements) ──────────
+  // LLM часто игнорирует REQUIRED SUBJECTS и выбирает эстетически сильные кадры.
+  // Мы гарантируем, что обязательные объекты займут не менее 20% слотов (мин. 3).
+  const reqKws = analysis.requiredElements.map((k) => k.toLowerCase());
+  const autoPlan: AIEditInstruction[] = [...plan];
+  if (reqKws.length > 0) {
+    const reqClips = effective.filter((v) => {
+      const t = textOf(v);
+      return reqKws.some((k) => t.includes(k));
+    });
+    if (reqClips.length > 0) {
+      const reqIdSet = new Set(reqClips.map((v) => v.id));
+      const reqInPlan = autoPlan.filter((inst) => reqIdSet.has(inst.clipId)).length;
+      const minReq = Math.max(3, Math.ceil(autoPlan.length * 0.2));
+      if (reqInPlan < minReq) {
+        const needed = minReq - reqInPlan;
+        const nonReqSlots = autoPlan
+          .map((inst, i) => ({ inst, i }))
+          .filter(({ inst }) => !reqIdSet.has(inst.clipId));
+        const reqAvail = shuffle([...reqClips]).filter(
+          (v) => !autoPlan.some((inst) => inst.clipId === v.id),
+        );
+        let injected = 0;
+        const step = Math.max(1, Math.floor(nonReqSlots.length / (needed + 1)));
+        for (let j = 1; j <= needed && injected < reqAvail.length; j++) {
+          const slot = nonReqSlots[Math.min(j * step, nonReqSlots.length - 1)];
+          const clipToInject = reqAvail[injected];
+          if (slot && clipToInject) {
+            autoPlan[slot.i] = { ...autoPlan[slot.i]!, clipId: clipToInject.id };
+            injected++;
+          }
+        }
+        console.log(`Quota: injected ${injected} required clips (${analysis.requiredElements.slice(0,4).join(", ")}), had ${reqInPlan}/${autoPlan.length} → now ${reqInPlan + injected}`);
+      } else {
+        console.log(`Quota OK: ${reqInPlan}/${autoPlan.length} clips match required elements (${analysis.requiredElements.slice(0,4).join(", ")})`);
+      }
+    } else {
+      console.log(`Quota: no library clips found matching required elements (${analysis.requiredElements.slice(0,4).join(", ")})`);
+    }
+  }
 
   const segments: VideoSegment[] = [];
   let accumulated = 0;

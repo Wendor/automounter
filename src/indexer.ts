@@ -379,6 +379,12 @@ export async function indexMediaFolder(
         }
         if (results.length > 0) {
           const best = results.reduce((a, b) => (a.score > b.score ? a : b));
+          // Объединяем описания всех кадров — каждый кадр может фиксировать разные объекты.
+          // Уникальные предложения, начиная с лучшего кадра.
+          const allDescriptions = [best.description, ...results
+            .filter((r) => r !== best && r.description && r.description !== "failed")
+            .map((r) => r.description)];
+          const description = [...new Set(allDescriptions)].join(" ");
           const videoInfo: VideoInfo = {
             id: filename,
             filePath,
@@ -389,7 +395,7 @@ export async function indexMediaFolder(
             location,
             aestheticScore:
               results.reduce((s, r) => s + r.score, 0) / results.length,
-            description: best.description,
+            description,
             tags: [
               ...new Set(
                 results.flatMap((r) => [...r.tags, ...r.detectedObjects]),

@@ -71,8 +71,8 @@ export const IndexMode = ({
         );
       case "reindex":
         const reindexItems = [
-          { name: "✕ No", description: "Index only new files", value: false },
-          { name: "✓ Yes", description: "Re-index everything", value: true },
+          { name: "No", description: "Index only new files", value: false },
+          { name: "Yes", description: "Re-index everything", value: true },
         ];
         return (
           <box style={{ flexDirection: "column", flexGrow: 1 }}>
@@ -92,8 +92,8 @@ export const IndexMode = ({
         );
       case "confirm":
         const confirmItems = [
-          { name: "▶ Start Indexing", description: "Run scanner", value: "go" },
-          { name: "↩ Back", description: "Main menu", value: "back" },
+          { name: "Start Indexing", description: "Run scanner", value: "go" },
+          { name: "Back", description: "Main menu", value: "back" },
         ];
         return (
           <box style={{ flexDirection: "column", flexGrow: 1 }}>

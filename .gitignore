@@ -3,6 +3,7 @@ package-lock.json
 music/*.mp3
 music/*.m4a
 result/*.mp4
+result/*.log
 luts/*.cube
 .DS_Store
 .claude

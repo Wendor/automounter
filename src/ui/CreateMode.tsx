@@ -382,7 +382,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
             value: "images",
           },
           {
-            name: "▶ YouTube URL",
+            name: "YouTube URL",
             description: "Ввести ссылку на видео",
             value: "youtube",
           },
@@ -499,8 +499,8 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
         );
       case "orientation":
         const orientationItems = [
-          { name: "⬛ Горизонтальное 16:9", description: "1920×1080 — YouTube, ПК", value: "horizontal" },
-          { name: "▮ Вертикальное 9:16", description: "1080×1920 — Reels, TikTok, Shorts", value: "vertical" },
+          { name: "Горизонтальное 16:9", description: "1920×1080 — YouTube, ПК", value: "horizontal" },
+          { name: "Вертикальное 9:16", description: "1080×1920 — Reels, TikTok, Shorts", value: "vertical" },
         ];
         return (
           <box style={{ flexDirection: "column", flexGrow: 1 }}>
@@ -521,8 +521,8 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
         );
       case "confirm":
         const confirmItems = [
-          { name: "▶ Запустить", description: "Начать рендеринг", value: "go" },
-          { name: "↩ Назад", description: "В главное меню", value: "back" },
+          { name: "Запустить", description: "Начать рендеринг", value: "go" },
+          { name: "Назад", description: "В главное меню", value: "back" },
         ];
         return (
           <box style={{ flexDirection: "column", flexGrow: 1 }}>

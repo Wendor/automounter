@@ -180,7 +180,7 @@ export const EditMode = ({
             value: "images",
           },
           {
-            name: "▶ YouTube URL",
+            name: "YouTube URL",
             description: "Ввести ссылку на видео",
             value: "youtube",
           },
@@ -291,8 +291,8 @@ export const EditMode = ({
         );
       case "confirm":
         const confirmItems = [
-          { name: "▶ Re-render", description: "Start export", value: "go" },
-          { name: "↩ Back", description: "Main menu", value: "back" },
+          { name: "Re-render", description: "Start export", value: "go" },
+          { name: "Back", description: "Main menu", value: "back" },
         ];
         return (
           <box style={{ flexDirection: "column", flexGrow: 1 }}>

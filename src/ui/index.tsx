@@ -52,7 +52,7 @@ interface MenuProps {
 const MainMenu = ({ hasSession, onSelect }: MenuProps) => {
   const items = [
     {
-      name: "  ✦  Создать ролик",
+      name: "Создать ролик",
       description: "Начать новый проект монтажа",
       value: "create",
     },

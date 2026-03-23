@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
+import * as fs from "fs";
+import * as path from "path";
 import { useTerminalDimensions, useKeyboard } from "@opentui/react";
 import { Config } from "../config";
 import { THEME } from "./index";
@@ -62,6 +64,28 @@ const ProgressBar = ({
   );
 };
 
+function saveLog(config: Config, logs: LogEntry[], status: "done" | "error"): void {
+  try {
+    const resultDir = path.join(process.cwd(), "result");
+    if (!fs.existsSync(resultDir)) fs.mkdirSync(resultDir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const logPath = path.join(resultDir, `${ts}_${status}.log`);
+    const lines: string[] = [
+      `Date: ${new Date().toISOString()}`,
+      `Status: ${status}`,
+      `Output: ${config.output}`,
+      `Prompt: ${config.prompt}`,
+      `Quality: ${config.quality}  Orientation: ${config.orientation}`,
+      "─".repeat(80),
+      ...logs.map((e) => {
+        const dur = e.duration != null ? `  ${(e.duration / 1000).toFixed(1)}s` : "";
+        return `${e.msg}${dur}`;
+      }),
+    ];
+    fs.writeFileSync(logPath, lines.join("\n"), "utf-8");
+  } catch {}
+}
+
 interface Props {
   config: Config;
   run: (cb: PipelineCB) => Promise<void>;
@@ -80,6 +104,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
 
   const currentStageRef = useRef(0);
   const totalStagesRef = useRef(1);
+  const logsRef = useRef<LogEntry[]>([]);
 
   const addLog = (msg: string) => {
     const now = Date.now();
@@ -89,7 +114,9 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
         const last = newLogs[newLogs.length - 1]!;
         if (!last.duration) last.duration = now - last.startTime;
       }
-      return [...newLogs, { msg, startTime: now }];
+      const next = [...newLogs, { msg, startTime: now }];
+      logsRef.current = next;
+      return next;
     });
   };
 
@@ -188,14 +215,15 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
         const contribution = (1 / total) * pct;
         setOverallPct(Math.round(base + contribution));
       },
-      done(path) {
+      done(outputPath) {
         setStages((prev) =>
           prev.map((s) => ({ ...s, status: "done", progress: 100 })),
         );
         setOverallPct(100);
-        addLog(`✓ Success: ${path}`);
+        addLog(`✓ Success: ${outputPath}`);
         console.log = origLog;
         console.warn = origWarn;
+        saveLog(config, logsRef.current, "done");
         setIsDone(true);
       },
       error(msg) {
@@ -205,6 +233,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
           ),
         );
         addLog(`✗ Error: ${msg}`);
+        saveLog(config, logsRef.current, "error");
         setErrorMsg(msg);
       },
     };
