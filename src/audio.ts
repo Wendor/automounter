@@ -54,9 +54,19 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
   const mt = new MusicTempo(audioData);
   const sampleRate = decoded.sampleRate;
 
+  // ─── 0. Коррекция двойного темпа ──────────────────────────────────────────
+  // music-tempo часто детектирует в 2x реального BPM (200 вместо 100).
+  // Если tempo > 140 BPM — вероятно двойной детект: делим пополам, берём каждый 2-й бит.
+  let tempoNum = parseFloat(mt.tempo);
+  let beats: number[] = [...mt.beats];
+  while (tempoNum > 140 && beats.length > 2) {
+    tempoNum = tempoNum / 2;
+    beats = beats.filter((_, i) => i % 2 === 0);
+  }
+  console.log(`Audio: tempo ${mt.tempo} BPM → corrected ${tempoNum.toFixed(0)} BPM, ${beats.length} beats`);
+
   // ─── 1. Sub-beats generation (1/2 beats) ─────────────────────────────────
   // Полезно для очень динамичных сцен
-  const beats = mt.beats;
   const subBeats: number[] = [];
   for (let i = 0; i < beats.length - 1; i++) {
     const b1 = beats[i] ?? 0;
@@ -123,7 +133,6 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
     }
   }
 
-  const tempoNum = parseFloat(mt.tempo);
   const overallStyle = classifyStyle(tempoNum, overallEnergy);
 
   const sections: AudioSection[] = normalizedRms.map((energy, i) => ({
@@ -134,8 +143,8 @@ export function analyzeAudio(wavFilePath: string): AudioAnalysis {
   }));
 
   return {
-    tempo: mt.tempo,
-    beats: mt.beats,
+    tempo: tempoNum.toFixed(0),
+    beats,
     subBeats,
     peaks,
     style: overallStyle,

@@ -11,23 +11,27 @@ const FFPROBE = ffprobeInstaller.path;
 
 // Разрешение кадра для анализа: 256×256 даёт 65536 пикселей — достаточно для
 // точных гистограмм, не слишком дорого по времени.
-const EVAL_RES = 256;
+const EVAL_RES = 512;
 const IMAGE_EXTS = /\.(jpe?g|png|webp|tiff?)$/i;
 const hwaccelArgs: string[] =
   process.platform === "darwin" ? ["-hwaccel", "videotoolbox"] : [];
 
 // ─── Публичные типы ───────────────────────────────────────────────────────────
 
+interface ChannelStats {
+  mean: number;
+  std: number;
+}
+
 /**
- * Цветовой профиль референса — кумулятивные функции распределения (CDF)
- * по каждому каналу RGB. Строится один раз из всех референсных изображений,
- * затем используется для согласования каждого сегмента.
+ * Цветовой профиль референса — среднее и стандартное отклонение по RGB.
+ * Используется для Reinhard color transfer: линейного выравнивания тона.
  */
 export interface ColorProfile {
-  rCDF: Float32Array; // [256] — кумулятивное распределение красного канала
-  gCDF: Float32Array; // [256] — зелёного
-  bCDF: Float32Array; // [256] — синего
-  pixelCount: number; // суммарное количество пикселей (для диагностики)
+  rStats: ChannelStats;
+  gStats: ChannelStats;
+  bStats: ChannelStats;
+  pixelCount: number;
 }
 
 /**
@@ -79,71 +83,55 @@ function extractRgbBuffer(imagePath: string): Promise<Buffer> {
   });
 }
 
-// ─── Гистограммный анализ ─────────────────────────────────────────────────────
+// ─── Статистический анализ (Reinhard color transfer) ─────────────────────────
 
-/**
- * Строит CDF по трём каналам из массива RGB-буферов.
- * Все буферы объединяются — это даёт нам глобальное распределение,
- * а не среднее от отдельных кадров (избегаем потери информации о разбросе).
- */
-function buildCDFs(buffers: Buffer[]): ColorProfile {
-  const rHist = new Float32Array(256);
-  const gHist = new Float32Array(256);
-  const bHist = new Float32Array(256);
-  let totalPixels = 0;
-
+function computeStats(buffers: Buffer[], offset: number): ChannelStats {
+  let sum = 0, sumSq = 0, count = 0;
   for (const buf of buffers) {
-    const pixels = Math.floor(buf.length / 3);
-    totalPixels += pixels;
-    for (let i = 0; i < pixels * 3; i += 3) {
-      rHist[buf[i]!]++;
-      gHist[buf[i + 1]!]++;
-      bHist[buf[i + 2]!]++;
+    for (let i = offset; i < buf.length; i += 3) {
+      const v = buf[i]!;
+      sum += v;
+      sumSq += v * v;
+      count++;
     }
   }
+  if (count === 0) return { mean: 128, std: 50 };
+  const mean = sum / count;
+  const std = Math.sqrt(Math.max(0, sumSq / count - mean * mean));
+  return { mean, std };
+}
 
-  const toCDF = (hist: Float32Array): Float32Array => {
-    const cdf = new Float32Array(256);
-    let sum = 0;
-    for (let v = 0; v < 256; v++) {
-      sum += hist[v]! / totalPixels;
-      cdf[v] = sum;
-    }
-    return cdf;
-  };
-
+function buildStats(buffers: Buffer[]): ColorProfile {
+  let totalPixels = 0;
+  for (const buf of buffers) totalPixels += Math.floor(buf.length / 3);
   return {
-    rCDF: toCDF(rHist),
-    gCDF: toCDF(gHist),
-    bCDF: toCDF(bHist),
+    rStats: computeStats(buffers, 0),
+    gStats: computeStats(buffers, 1),
+    bStats: computeStats(buffers, 2),
     pixelCount: totalPixels,
   };
 }
 
 /**
- * Histogram matching: для каждого входного значения [0..255] находим
- * выходное значение с ближайшим CDF через бинарный поиск.
- * Это аналитическое (детерминированное) решение, не требует оптимизации.
+ * Reinhard linear LUT: сдвигает mean и масштабирует std источника
+ * под референс. Шкала ограничена [0.4..2.5] для полноценного контраста.
  */
-function buildMatchLUT(srcCDF: Float32Array, refCDF: Float32Array): Uint8Array {
+function buildReinhardLUT(srcStats: ChannelStats, refStats: ChannelStats): Uint8Array {
   const lut = new Uint8Array(256);
-  for (let sv = 0; sv < 256; sv++) {
-    const target = srcCDF[sv]!;
-    let lo = 0,
-      hi = 255;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (refCDF[mid]! < target) lo = mid + 1;
-      else hi = mid;
-    }
-    lut[sv] = lo;
+  const scale = srcStats.std > 2
+    ? Math.max(0.4, Math.min(2.5, refStats.std / srcStats.std))
+    : 1.0;
+  for (let v = 0; v < 256; v++) {
+    lut[v] = Math.max(0, Math.min(255, Math.round(
+      (v - srcStats.mean) * scale + refStats.mean
+    )));
   }
   return lut;
 }
 
 // Точки семплирования кривой для curves-фильтра FFmpeg.
 // 9 точек достаточно для точного представления гистограммного LUT.
-const CURVE_SAMPLES = [0, 32, 64, 96, 128, 160, 192, 224, 255];
+const CURVE_SAMPLES = [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255];
 
 function lutToCurvePoints(lut: Uint8Array): string {
   return CURVE_SAMPLES.map(
@@ -151,27 +139,27 @@ function lutToCurvePoints(lut: Uint8Array): string {
   ).join(" ");
 }
 
-// Какую долю коррекции оставляем per-channel (хроматическая).
-// Остаток (1 - CHROMA_WEIGHT) — это яркостная коррекция, одинаковая для всех
-// каналов, которая сохраняет нейтральные цвета (серый остаётся серым).
-// 0.0 = только яркость, нет сдвига оттенка; 1.0 = полная per-channel коррекция.
-const CHROMA_WEIGHT = 0.4;
+// Доля per-channel коррекции vs luma-only.
+// Reinhard сам по себе безопасен для нейтралей: если R/G/B имеют одинаковые
+// mean/std, все каналы сдвигаются одинаково → цветовой каст не возникает.
+// Поэтому можно держать CHROMA_WEIGHT высоким для полноценного контраста.
+const CHROMA_WEIGHT = 0.85;
 
 /**
- * Строит SegmentLUTs из профилей источника и референса.
+ * Строит SegmentLUTs методом Reinhard color transfer.
  *
  * Алгоритм:
- * 1. Per-channel гистограммное согласование (R, G, B отдельно).
- * 2. Яркостная LUT = перцептивно взвешенное среднее каналов (0.299R+0.587G+0.114B).
- *    Эта LUT одинакова для всех трёх каналов → нейтрали (серые) остаются серыми.
- * 3. Финальная LUT каждого канала = (1-CHROMA_WEIGHT) яркостная + CHROMA_WEIGHT per-channel.
- *    Это убирает жёлтый/зелёный cast при сохранении лёгкой цветовой коррекции.
+ * 1. Per-channel Reinhard LUT: сдвигает mean, масштабирует std.
+ *    Линейный — не создаёт "ядовитых" артефактов CDF-матчинга.
+ * 2. Яркостная LUT = перцептивно взвешенное среднее (BT.601).
+ *    Нейтрали (серые) остаются серыми.
+ * 3. Финал = (1-CHROMA_WEIGHT) luma + CHROMA_WEIGHT per-channel.
  */
 function buildSegmentLUTs(srcBufs: Buffer[], refProfile: ColorProfile): SegmentLUTs {
-  const src = buildCDFs(srcBufs);
-  const rLUT = buildMatchLUT(src.rCDF, refProfile.rCDF);
-  const gLUT = buildMatchLUT(src.gCDF, refProfile.gCDF);
-  const bLUT = buildMatchLUT(src.bCDF, refProfile.bCDF);
+  const src = buildStats(srcBufs);
+  const rLUT = buildReinhardLUT(src.rStats, refProfile.rStats);
+  const gLUT = buildReinhardLUT(src.gStats, refProfile.gStats);
+  const bLUT = buildReinhardLUT(src.bStats, refProfile.bStats);
 
   // Яркостная LUT: перцептивные веса ITU-R BT.601
   const lumaLUT = new Uint8Array(256);
@@ -216,11 +204,12 @@ export function smoothLUTs(luts: (SegmentLUTs | null)[]): (SegmentLUTs | null)[]
   return luts.map((cur, i) => {
     if (!cur) return null;
 
-    // Собираем доступных соседей с весами [prev=0.2, cur=0.6, next=0.2]
-    const NEIGHBOR_WEIGHT = 0.2;
-    const entries: { lut: SegmentLUTs; w: number }[] = [{ lut: cur, w: 0.6 }];
-    if (i > 0 && luts[i - 1]) entries.push({ lut: luts[i - 1]!, w: NEIGHBOR_WEIGHT });
-    if (i < n - 1 && luts[i + 1]) entries.push({ lut: luts[i + 1]!, w: NEIGHBOR_WEIGHT });
+    // Гауссово окно радиуса 2: [i-2=0.1, i-1=0.2, i=0.4, i+1=0.2, i+2=0.1]
+    const entries: { lut: SegmentLUTs; w: number }[] = [{ lut: cur, w: 0.4 }];
+    if (i > 0 && luts[i - 1]) entries.push({ lut: luts[i - 1]!, w: 0.2 });
+    if (i < n - 1 && luts[i + 1]) entries.push({ lut: luts[i + 1]!, w: 0.2 });
+    if (i > 1 && luts[i - 2]) entries.push({ lut: luts[i - 2]!, w: 0.1 });
+    if (i < n - 2 && luts[i + 2]) entries.push({ lut: luts[i + 2]!, w: 0.1 });
 
     // Нормализуем веса (на случай отсутствующих соседей)
     const totalW = entries.reduce((s, e) => s + e.w, 0);
@@ -374,7 +363,7 @@ export async function buildColorProfile(
     if (valid.length === 0)
       throw new Error("Не удалось прочитать ни один референсный кадр");
 
-    const profile = buildCDFs(valid);
+    const profile = buildStats(valid);
     log(
       `Reference profile built from ${valid.length} image(s) (${profile.pixelCount.toLocaleString()} px)`,
     );
@@ -416,7 +405,7 @@ export async function analyzeSegmentColors(
 
   try {
     // 3 кадра: 15%, 50%, 85% от длительности сегмента
-    const offsets = [0.15, 0.5, 0.85].map((f) =>
+    const offsets = [0.1, 0.25, 0.5, 0.75, 0.9].map((f) =>
       Math.max(0, startTime + segmentDuration * f),
     );
 

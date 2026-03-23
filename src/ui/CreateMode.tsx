@@ -277,15 +277,11 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
         );
       case "lut_choice":
         const lutItems = [
-          ...(form.lut
-            ? [
-                {
-                  name: "Оставить текущий",
-                  description: path.basename(form.lut),
-                  value: "keep",
-                },
-              ]
-            : []),
+          {
+            name: "Оставить текущий",
+            description: form.lut ? path.basename(form.lut) : "без LUT",
+            value: "keep",
+          },
           {
             name: "◈ Из папки luts/",
             description: "Выбрать файл",
@@ -361,17 +357,15 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
         );
       case "color_ref_choice":
         const colorRefItems = [
-          ...(form.colorRef
-            ? [
-                {
-                  name: "Оставить текущий",
-                  description: form.colorRef.startsWith("http")
-                    ? form.colorRef.slice(0, 50)
-                    : path.basename(form.colorRef),
-                  value: "keep",
-                },
-              ]
-            : []),
+          {
+            name: "Оставить текущий",
+            description: form.colorRef
+              ? form.colorRef.startsWith("http")
+                ? form.colorRef.slice(0, 50)
+                : path.basename(form.colorRef)
+              : "без референса",
+            value: "keep",
+          },
           {
             name: "✕ Без референса",
             description: "Только LUT цветокоррекция",
@@ -522,7 +516,7 @@ export const CreateMode = ({ saved, cwd, onDone, onBack }: Props) => {
                   audio: form.audio,
                   prompt: form.prompt,
                   duration: parseInt(form.duration, 10) || 60,
-                  lut: form.lut || path.join(cwd, "cinematic.cube"),
+                  lut: form.lut,
                   model: form.model,
                   output: form.output,
                   bitrate: 0,

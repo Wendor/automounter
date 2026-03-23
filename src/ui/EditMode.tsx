@@ -81,15 +81,11 @@ export const EditMode = ({
     switch (step) {
       case "lut_choice":
         const lutItems = [
-          ...(lut
-            ? [
-                {
-                  name: "Keep current",
-                  description: path.basename(lut),
-                  value: "keep",
-                },
-              ]
-            : []),
+          {
+            name: "Keep current",
+            description: lut ? path.basename(lut) : "без LUT",
+            value: "keep",
+          },
           {
             name: "◈ Browse luts/",
             description: "Select file",
@@ -164,17 +160,15 @@ export const EditMode = ({
         );
       case "color_ref_choice":
         const colorRefItems = [
-          ...(colorRef
-            ? [
-                {
-                  name: "Оставить текущий",
-                  description: colorRef.startsWith("http")
-                    ? colorRef.slice(0, 50)
-                    : path.basename(colorRef),
-                  value: "keep",
-                },
-              ]
-            : []),
+          {
+            name: "Оставить текущий",
+            description: colorRef
+              ? colorRef.startsWith("http")
+                ? colorRef.slice(0, 50)
+                : path.basename(colorRef)
+              : "без референса",
+            value: "keep",
+          },
           {
             name: "✕ Без референса",
             description: "Только LUT цветокоррекция",

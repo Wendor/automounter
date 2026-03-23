@@ -4,7 +4,6 @@ import ffmpeg from "fluent-ffmpeg";
 import {
   VideoSegment,
   SliceResult,
-  SegmentEffect,
   RenderQuality,
 } from "./types";
 
@@ -59,21 +58,28 @@ function buildVideoFilter(
   hasLut: boolean,
   videoFadeDuration: number,
   quality: RenderQuality,
+  targetFps: number,
 ): string {
   const filters: string[] = [];
   filters.push(
     "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1",
   );
 
-  // Плавный зум, растянутый на всю длительность сегмента
-  const effect: SegmentEffect = segment.effect;
-  if (effect === "zoomIn") {
+  const totalFrames = Math.max(1, Math.round(segment.targetDuration * targetFps));
+
+  // Зум через scale:eval=frame + crop с фиксированным выходом (1920x1080).
+  // zoompan несовместим с DJI H.264/B-frames → "Invalid argument".
+  // scale:eval=frame меняет только SWS-контекст каждый кадр, crop-выход остаётся фиксированным.
+  if (segment.zoomEffect === "zoomIn") {
+    // Ширина 1920→2074 (+8%), crop центрирует → контент плавно приближается
+    // h=-2: всегда чётное (yuv420p требует чётных размеров)
     filters.push(
-      `scale='iw*(1+0.08*t/${segment.targetDuration})':-1,crop=1920:1080`,
+      `scale=w='trunc((1920+154*n/${totalFrames})/2)*2':h=-2:eval=frame,crop=1920:1080`,
     );
-  } else if (effect === "zoomOut") {
+  } else if (segment.zoomEffect === "zoomOut") {
+    // Ширина 2074→1920 (-8%), crop центрирует → контент плавно отдаляется
     filters.push(
-      `scale='iw*(1.08-0.08*t/${segment.targetDuration})':-1,crop=1920:1080`,
+      `scale=w='trunc((2074-154*n/${totalFrames})/2)*2':h=-2:eval=frame,crop=1920:1080`,
     );
   }
 
@@ -82,29 +88,62 @@ function buildVideoFilter(
   if (hasLut) filters.push(`lut3d='${formatLutPathForFFmpeg(lutFile)}'`);
   if (segment.eqFilter) filters.push(segment.eqFilter);
 
+  // Эффект входа (начало сегмента)
   const fadeOutStart = Math.max(0, segment.targetDuration - videoFadeDuration);
-  switch (effect) {
-    case "fadeIn":
-      filters.push(`fade=t=in:st=0:d=${videoFadeDuration}`);
-      break;
-    case "fadeOut":
-      filters.push(`fade=t=out:st=${fadeOutStart}:d=${videoFadeDuration}`);
-      break;
-    case "flashIn":
-      filters.push(`fade=t=in:st=0:d=${videoFadeDuration}:color=white`);
-      break;
-    case "flashOut":
-      filters.push(
-        `fade=t=out:st=${fadeOutStart}:d=${videoFadeDuration}:color=white`,
-      );
-      break;
-  }
+  if (segment.entryEffect === "fadeIn")
+    filters.push(`fade=t=in:st=0:d=${videoFadeDuration}`);
+  else if (segment.entryEffect === "flashIn")
+    filters.push(`fade=t=in:st=0:d=${videoFadeDuration}:color=white`);
+
+  // Эффект выхода (конец сегмента)
+  if (segment.exitEffect === "fadeOut")
+    filters.push(`fade=t=out:st=${fadeOutStart}:d=${videoFadeDuration}`);
+  else if (segment.exitEffect === "flashOut")
+    filters.push(`fade=t=out:st=${fadeOutStart}:d=${videoFadeDuration}:color=white`);
 
   filters.push("scale=1920:1080,setsar=1,format=yuv420p");
   return filters.join(",");
 }
 
-function renderSegment(
+function runFfmpegSegment(
+  segment: VideoSegment,
+  overrideZoom: "zoomIn" | "zoomOut" | "none",
+  codec: string,
+  targetFps: number,
+  hasLut: boolean,
+  lutFile: string,
+  videoFadeDuration: number,
+  quality: RenderQuality,
+  onProgress?: RenderProgressCallback,
+  index?: number,
+): Promise<void> {
+  const seg = overrideZoom === segment.zoomEffect
+    ? segment
+    : { ...segment, zoomEffect: overrideZoom };
+  const videoFilter = buildVideoFilter(seg, lutFile, hasLut, videoFadeDuration, quality, targetFps);
+  return new Promise((resolve, reject) => {
+    ffmpeg(segment.sourceFile)
+      .inputOptions(["-ss", String(segment.startTime), "-t", String(segment.rawDuration)])
+      .outputOptions([
+        "-c:v", codec,
+        "-b:v", `${quality.bitrate || 25}M`,
+        "-an",
+        "-filter:v", videoFilter,
+        "-r", String(targetFps),
+        "-t", segment.targetDuration.toFixed(6),
+        "-pix_fmt", "yuv420p",
+      ])
+      .on("progress", (p: any) => {
+        if (p.timemark && index !== undefined)
+          onProgress?.(index, Math.min(99, (timemarkToSeconds(p.timemark) / segment.rawDuration) * 100));
+      })
+      .on("end", () => { if (index !== undefined) onProgress?.(index, 100); resolve(); })
+      .on("error", (err: Error) => reject(err))
+      .save(segment.outputFile);
+  });
+}
+
+async function renderSegment(
   segment: VideoSegment,
   index: number,
   codec: string,
@@ -114,58 +153,30 @@ function renderSegment(
   videoFadeDuration: number,
   quality: RenderQuality,
   onProgress?: RenderProgressCallback,
+  total?: number,
 ): Promise<void> {
   if (fs.existsSync(segment.outputFile)) {
     onProgress?.(index, 100);
-    return Promise.resolve();
+    return;
   }
-  const videoFilter = buildVideoFilter(
-    segment,
-    lutFile,
-    hasLut,
-    videoFadeDuration,
-    quality,
-  );
-  return new Promise((resolve, reject) => {
-    ffmpeg(segment.sourceFile)
-      .inputOptions([
-        "-ss",
-        String(segment.startTime),
-        "-t",
-        String(segment.rawDuration),
-      ])
-      .outputOptions([
-        "-c:v",
-        codec,
-        "-b:v",
-        `${quality.bitrate || 25}M`,
-        "-an",
-        "-filter:v",
-        videoFilter,
-        "-r",
-        String(targetFps),
-        "-t",
-        segment.targetDuration.toFixed(6),
-        "-pix_fmt",
-        "yuv420p",
-      ])
-      .on("progress", (p: any) => {
-        if (p.timemark)
-          onProgress?.(
-            index,
-            Math.min(
-              99,
-              (timemarkToSeconds(p.timemark) / segment.rawDuration) * 100,
-            ),
-          );
-      })
-      .on("end", () => {
-        onProgress?.(index, 100);
-        resolve();
-      })
-      .on("error", (err: Error) => reject(err))
-      .save(segment.outputFile);
-  });
+  const name = path.basename(segment.sourceFile);
+  const speedPct = Math.round((segment.rawDuration / segment.targetDuration) * 100);
+  const totalStr = total !== undefined ? `/${total}` : "";
+  const fx = [segment.zoomEffect !== "none" ? segment.zoomEffect : "", segment.entryEffect !== "none" ? segment.entryEffect : "", segment.exitEffect !== "none" ? segment.exitEffect : ""].filter(Boolean).join("+") || "none";
+  console.log(`  Rendering [${index + 1}${totalStr}] ${name}  ${segment.targetDuration.toFixed(1)}s (speed ${speedPct}%)  ${fx}`);
+
+  try {
+    await runFfmpegSegment(segment, segment.zoomEffect, codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, onProgress, index);
+  } catch (err) {
+    // zoompan падает на VFR/B-frames DJI footage — повторяем без zoom
+    if (segment.zoomEffect !== "none") {
+      console.warn(`  [zoom fallback] ${name}: retry without zoom`);
+      if (fs.existsSync(segment.outputFile)) fs.unlinkSync(segment.outputFile);
+      await runFfmpegSegment(segment, "none", codec, targetFps, hasLut, lutFile, videoFadeDuration, quality, onProgress, index);
+    } else {
+      throw err;
+    }
+  }
 }
 
 async function renderWithConcurrency(
@@ -195,6 +206,7 @@ async function renderWithConcurrency(
           videoFadeDuration,
           quality,
           onProgress,
+          segments.length,
         );
     }
   };

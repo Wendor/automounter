@@ -8,7 +8,12 @@ import ffprobeInstaller from "@ffprobe-installer/ffprobe";
 import { loadConfig, loadSavedConfig, saveConfig } from "./src/config";
 import { convertMp3ToWav, analyzeAudio } from "./src/audio";
 import { indexMediaFolder } from "./src/indexer";
-import { createDirectorPlan, preFilterFiles } from "./src/director";
+import {
+  createDirectorPlan,
+  analyzePrompt,
+  geocodeLocationNames,
+  preFilterByPrompt,
+} from "./src/director";
 import { renderSegments, concatenateAndAddMusic } from "./src/render";
 import {
   buildColorProfile,
@@ -204,23 +209,61 @@ async function runMainPipeline(
 
     cb.info(`${allFiles.length} files found`);
 
-    const basicFilesInfo = allFiles.map((file) => ({
-      id: file,
-      date: fs.statSync(path.join(config.input, file)).birthtime.toISOString(),
-    }));
+    // Читаем кэш GPS + теги для каждого файла (быстро, без LLM)
+    const allCachedTags = new Set<string>();
+    const basicFilesInfo = allFiles.map((file) => {
+      const filePath = path.join(config.input, file);
+      const cachePath = filePath + ".json";
+      let lat: number | undefined, lon: number | undefined, cachedDate: string | undefined;
+      if (fs.existsSync(cachePath)) {
+        try {
+          const cache = JSON.parse(fs.readFileSync(cachePath).toString());
+          lat = cache.location?.lat;
+          lon = cache.location?.lon;
+          cachedDate = cache.creationDate;
+          if (Array.isArray(cache.tags)) cache.tags.forEach((t: string) => allCachedTags.add(t));
+        } catch {}
+      }
+      return {
+        id: file,
+        date: cachedDate ?? fs.statSync(filePath).birthtime.toISOString(),
+        lat,
+        lon,
+      };
+    });
 
     cb.stage(3, stageNames, 2);
     cb.log("Checking Ollama connection...");
     await checkOllamaAvailable(config.model);
 
-    cb.log("AI is filtering files by date range...");
-    const requestedFileIds: string[] = await preFilterFiles(
-      config.prompt,
-      basicFilesInfo,
-      config.model,
-    );
+    cb.log("AI analyzing prompt...");
+    const today = new Date().toISOString().slice(0, 10);
+    const rawAnalysis = await analyzePrompt(config.prompt, today, config.model, [...allCachedTags]);
+    // Сброс даты если LLM вернул сегодня (галлюцинация при отсутствии временного контекста)
+    const promptAnalysis =
+      rawAnalysis.dateStart === today && rawAnalysis.dateEnd === today
+        ? { ...rawAnalysis, dateStart: null, dateEnd: null }
+        : rawAnalysis;
+    if (promptAnalysis.locationNames.length > 0) {
+      cb.log(`Locations: ${promptAnalysis.locationNames.join(", ")}`);
+      cb.log("Geocoding locations via Nominatim...");
+    }
+    const targetLocations = await geocodeLocationNames(promptAnalysis.locationNames);
+    if (targetLocations.length > 0) {
+      cb.info(targetLocations.map((l) => `${l.name} → ${l.lat.toFixed(3)},${l.lon.toFixed(3)}`).join(" | "));
+    }
+    if (promptAnalysis.dateStart || promptAnalysis.dateEnd) {
+      cb.log(`Date range: ${promptAnalysis.dateStart ?? "?"} → ${promptAnalysis.dateEnd ?? "?"}`);
+    }
+    if (promptAnalysis.includeTravel) cb.log("Trip mode: including travel footage");
+
+    const preFilter = preFilterByPrompt(promptAnalysis, targetLocations, basicFilesInfo);
+    const requestedFileIds = preFilter.ids;
     if (requestedFileIds.length === 0) {
-      throw new Error("Нет файлов в диапазоне дат. Проверь промпт.");
+      throw new Error("Нет файлов по запросу. Проверь промпт.");
+    }
+    if (preFilter.tripDateRange) {
+      cb.info(`Trip dates: ${preFilter.tripDateRange.start} → ${preFilter.tripDateRange.end} (from GPS)`);
     }
     cb.info(`${requestedFileIds.length}/${allFiles.length} clips selected`);
 
@@ -236,27 +279,25 @@ async function runMainPipeline(
       (done, total) => cb.renderTick(0, (done / total) * 100, done, total),
     );
 
-    cb.log("Calculating optimal render quality...");
-    const allFilePaths = requestedFileIds.map((f) =>
-      path.join(config.input, f),
-    );
-    const quality = await resolveQuality(config.quality, allFilePaths);
-    cb.info(`${quality.bitrate} Mbps · ${quality.x264preset}`);
-
     cb.stage(5, stageNames, 4);
     cb.log("AI Director is building edit plan...");
     const plan = await createDirectorPlan(
-      config.prompt,
+      promptAnalysis,
+      targetLocations,
       videos,
       audioAnalysis,
       config.duration,
       TEMP_DIR,
-      config.model,
     );
     if (plan.segments.length === 0) throw new Error("Пустой план монтажа.");
     cb.info(
       `${plan.segments.length} scenes · ${plan.totalDuration.toFixed(1)}s`,
     );
+
+    cb.log("Calculating optimal render quality...");
+    const usedFilePaths = [...new Set(plan.segments.map((s) => s.sourceFile))];
+    const quality = await resolveQuality(config.quality, usedFilePaths);
+    cb.info(`${quality.bitrate} Mbps · ${quality.x264preset}`);
 
     if (hasColorRef) {
       cb.stage(6, stageNames, 5);

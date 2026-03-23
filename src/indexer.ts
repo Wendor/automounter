@@ -242,7 +242,20 @@ async function evaluateFrameWithVisionAI(
 ): Promise<VisionAIResponse> {
   const imageBuffer = fs.readFileSync(imagePath);
   const base64Image = imageBuffer.toString("base64");
-  const promptText = `Analyze this drone frame. Return ONLY JSON: {"score": 1-10, "description": "detailed summary", "tags": [], "detectedObjects": [], "timeOfDay", "landscape", "cameraAngle", "motion", "dominantColors": [], "motionEstimate": 0.0-1.0}. No markdown, only JSON.`;
+  const promptText = `Analyze this drone/aerial footage frame. Return ONLY valid JSON, no markdown.
+
+{
+  "score": <1-10 aesthetic quality>,
+  "description": "<1-2 sentences: what is shown, from aerial perspective, mention specific subjects>",
+  "tags": ["<single English words or short 2-word phrases describing SUBJECTS visible in frame: car, suv, truck, person, crowd, building, bridge, river, forest, road, field, mountain, etc. Be specific: prefer 'suv' over 'vehicle', 'pickup truck' over 'car'. Always tag humans if visible: person, people, man, woman, crowd, pedestrian>"],
+  "detectedObjects": ["<specific objects with color/type: white suv, red truck, pedestrian, cyclist, boat>"],
+  "timeOfDay": "<day|golden hour|sunset|sunrise|night|overcast>",
+  "landscape": "<urban|rural|coastal|mountain|desert|forest|mixed>",
+  "cameraAngle": "<top-down|oblique|low-angle|horizon>",
+  "motion": "<static|slow pan|fast movement|rotation>",
+  "dominantColors": ["<color names>"],
+  "motionEstimate": <0.0 static - 1.0 very fast>
+}`;
   try {
     const response = await fetch("http://localhost:11434/api/generate", {
       method: "POST",

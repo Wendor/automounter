@@ -76,6 +76,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
   const [overallPct, setOverallPct] = useState(0);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isDone, setIsDone] = useState(false);
 
   const currentStageRef = useRef(0);
   const totalStagesRef = useRef(1);
@@ -93,11 +94,10 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
   };
 
   useKeyboard((key) => {
-    if (
-      errorMsg &&
-      (key.name === "q" || key.name === "return" || key.name === "escape")
-    )
+    if (errorMsg && (key.name === "q" || key.name === "return" || key.name === "escape"))
       onError(errorMsg);
+    if (isDone && (key.name === "q" || key.name === "return" || key.name === "escape"))
+      onDone();
   });
 
   useEffect(() => {
@@ -196,7 +196,7 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
         addLog(`✓ Success: ${path}`);
         console.log = origLog;
         console.warn = origWarn;
-        setTimeout(onDone, 1500);
+        setIsDone(true);
       },
       error(msg) {
         setStages((prev) =>
@@ -299,17 +299,17 @@ export const PipelineView = ({ config, run, onDone, onError }: Props) => {
           }}
         >
           <text
-            style={{ fg: errorMsg ? THEME.error : THEME.text, attributes: 1 }}
+            style={{ fg: errorMsg ? THEME.error : isDone ? THEME.success : THEME.text, attributes: 1 }}
           >
             {" "}
-            {errorMsg ? "FATAL ERROR (Press Q to exit)" : "ACTIVITY LOG"}{" "}
+            {errorMsg ? "FATAL ERROR (Press Q to exit)" : isDone ? "DONE — Press Q/Enter to exit" : "ACTIVITY LOG"}{" "}
           </text>
           <box style={{ flexGrow: 1, marginTop: 1, flexDirection: "column" }}>
             <scrollbox
               ref={scrollRef}
               style={{ width: "100%", height: "100%" }}
               scrollY={true}
-              stickyScroll={true}
+              stickyScroll={!isDone}
               stickyStart="bottom"
             >
               {logs.map((log, i) => (

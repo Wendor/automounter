@@ -29,15 +29,9 @@ export interface AudioAnalysis {
   sections: AudioSection[]; // 2-second windowed breakdown
 }
 
-export type SegmentEffect =
-  | "fadeIn"
-  | "fadeOut"
-  | "flashIn"
-  | "flashOut"
-  | "cut"
-  | "zoomIn"
-  | "zoomOut"
-  | "none";
+export type ZoomEffect = "zoomIn" | "zoomOut" | "none";
+export type EntryEffect = "fadeIn" | "flashIn" | "none";
+export type ExitEffect = "fadeOut" | "flashOut" | "none";
 
 export interface ValidZone {
   start: number;
@@ -69,9 +63,18 @@ export interface VideoInfo {
   isSlowMotionSuitable?: boolean;
 }
 
+export type ZoneHint = "start" | "middle" | "end";
+
 export interface AIEditInstruction {
   clipId: string;
   beatsDuration: number;
+  zoomEffect?: ZoomEffect;
+  entryEffect?: EntryEffect;
+  exitEffect?: ExitEffect;
+  speedFactor?: number;        // 0.5=slow, 1.0=normal, 1.4=fast
+  transition?: "dissolve" | "hard";
+  transitionDuration?: number; // seconds
+  zoneHint?: ZoneHint;         // откуда брать момент в клипе
 }
 
 export interface VideoSegment {
@@ -83,7 +86,9 @@ export interface VideoSegment {
   outputFile: string;
   isFirst: boolean;
   isLast: boolean;
-  effect: SegmentEffect;
+  zoomEffect: ZoomEffect;
+  entryEffect: EntryEffect;
+  exitEffect: ExitEffect;
   slowMotionFactor: number;
   sourceFps: number; // native fps of source clip
   transition: "dissolve" | "hard"; // transition INTO this segment from previous

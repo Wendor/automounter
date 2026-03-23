@@ -1,6 +1,7 @@
 node_modules
 package-lock.json
 music/*.mp3
+music/*.m4a
 result/*.mp4
 luts/*.cube
 .DS_Store
