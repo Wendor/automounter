@@ -143,32 +143,42 @@ function minDistKm(video: VideoInfo, targets: GeoLocation[]): number | null {
  */
 const TEXT_MODEL = DEFAULT_TEXT_MODEL;
 
-const TAG_BATCH_SIZE = 400;
+const TAG_BATCH_SIZE = 100;
 
 /**
  * Классифицирует батч тегов по темам пользователя.
  * Возвращает: для каждой темы — какие теги из батча к ней относятся; + exclude.
  */
 async function classifyTagBatch(
-  prompt: string,
   topics: PromptTopic[],
+  forbiddenList: string[],
   tags: string[],
   batchIdx: number,
   totalBatches: number,
 ): Promise<{ topicTags: Record<string, string[]>; exclude: string[] }> {
   const empty = { topicTags: {}, exclude: [] };
-  const topicList = topics.map((t) => `"${t.name}"${t.required ? " (required)" : ""}`).join(", ");
-  const p = `User request: "${prompt}"
-User topics: ${topicList}
+  const topicList = topics.map((t) => `"${t.name}"`).join(", ");
+  const forbidden = forbiddenList.length > 0 ? forbiddenList.join(", ") : "none";
+  
+  const p = `Classification Task (Batch ${batchIdx + 1}/${totalBatches})
+Target Topics: ${topicList}
+Forbidden Categories: ${forbidden}
 
-Library tags batch ${batchIdx + 1}/${totalBatches}:
-${tags.join(", ")}
+Tags to classify: ${tags.join(", ")}
 
-For each tag, assign it to ONE topic name (exact match from the list above) if it visually matches that topic.
-Mark as "exclude" if the user explicitly does NOT want this content.
-Omit tags that don't clearly match any topic.
+Task: Match tags to Topics or Forbidden Categories.
+Instructions:
+1. Map a tag to a Topic ONLY if it is a clear visual match.
+2. Map a tag to a Forbidden Category ONLY if it is a specific instance of that category (e.g. map "suv" to "cars").
+3. CRITICAL: Do NOT map abstract concepts, colors, or environments (e.g. "sky", "white", "clouds", "hilly", "green") to Forbidden Categories just because they might be near forbidden items. Only map literal physical objects.
+4. If a tag doesn't perfectly fit a Topic or a Forbidden Category, IGNORE IT entirely. Do not include it in the JSON.
 
-Return ONLY JSON: {"topics":{"topic_name":["tag1","tag2"]},"exclude":[]}`;
+Return ONLY JSON:
+{
+  "topic_matches": { "topic_name": ["tag1"] },
+  "forbidden_matches": { "category_name": ["tag2"] }
+}`;
+  
   console.log(`  Tag batch ${batchIdx + 1}/${totalBatches} (${tags.length} tags)...`);
   try {
     const ctrl = new AbortController();
@@ -184,17 +194,30 @@ Return ONLY JSON: {"topics":{"topic_name":["tag1","tag2"]},"exclude":[]}`;
     const parsed = JSON.parse(cleanJSONString(data.response));
     const tagSet = new Set(tags);
     const topicNames = new Set(topics.map((t) => t.name));
+    
     const topicTags: Record<string, string[]> = {};
-    if (parsed.topics && typeof parsed.topics === "object") {
-      for (const [name, arr] of Object.entries(parsed.topics)) {
+    if (parsed.topic_matches && typeof parsed.topic_matches === "object") {
+      for (const [name, arr] of Object.entries(parsed.topic_matches)) {
         if (!topicNames.has(name)) continue;
-        const clean = Array.isArray(arr) ? arr.filter((t: any) => typeof t === "string" && tagSet.has(t)) : [];
+        const clean = Array.isArray(arr) ? [...new Set(arr.filter((t: any) => typeof t === "string" && tagSet.has(t)))] as string[] : [];
         if (clean.length > 0) topicTags[name] = clean;
       }
     }
-    const exclude = Array.isArray(parsed.exclude) ? parsed.exclude.filter((t: any) => typeof t === "string" && tagSet.has(t)) : [];
-    const total = Object.values(topicTags).reduce((s, a) => s + a.length, 0);
-    console.log(`  Tag batch ${batchIdx + 1} done: ${total} topic tags, ${exclude.length} exclude`);
+    
+    const excludeSet = new Set<string>();
+    if (parsed.forbidden_matches && typeof parsed.forbidden_matches === "object") {
+      for (const arr of Object.values(parsed.forbidden_matches)) {
+        if (Array.isArray(arr)) {
+          arr.filter((t: any) => typeof t === "string" && tagSet.has(t)).forEach(t => excludeSet.add(t));
+        }
+      }
+    }
+    const exclude = [...excludeSet];
+    
+    const matchedCount = Object.values(topicTags).reduce((s, a) => s + a.length, 0) + exclude.length;
+    const ignoredCount = Math.max(0, tags.length - matchedCount);
+    
+    console.log(`  Tag batch ${batchIdx + 1} done: ${Object.values(topicTags).flat().length} topic, ${exclude.length} exclude, ${ignoredCount} ignored`);
     return { topicTags, exclude };
   } catch (e) {
     console.log(`  Tag batch ${batchIdx + 1} failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -230,17 +253,12 @@ Respond ONLY with valid JSON:
 
 Rules:
 - dateStart/dateEnd: extract time range ONLY if the request explicitly mentions a time period. Both null if no time mentioned.
-  Year hints: "прошлый/прошлогодний" = ${prev}, "этот год" = ${year}.
-  Seasons: summer/лето=Y-06-01..Y-08-31, autumn/осень=Y-09-01..Y-11-30, winter/зима=Y-12-01..(Y+1)-02-28, spring/весна=Y-03-01..Y-05-31.
 - locationNames: ONLY named places explicitly mentioned. Keep original spelling.
 - includeTravel: true if request implies travel (поездка, путешествие, ехали, дорога, trip).
 - style: cinematic | fast-paced | calm | vlog.
-- topics: list of distinct visual subjects/themes the user wants in the video. Each topic:
-  - name: short label in the user's language (e.g. "природа", "машина")
-  - keywords: 3-8 English synonyms for library tag search (broad, visual terms only)
-  - required: true ONLY if explicitly required ("с X", "with X", "featuring", "включая", "в кадре")
-  Do NOT include style/mood/location as topics. Keep topics distinct.
-- excludeKeywords: content to EXCLUDE — exhaustive English synonyms. Example "без людей" → ["people","person","man","woman","child","crowd","tourist","pedestrian","human","figure","silhouette","hiker"].`;
+- topics: list of subjects/themes the user wants (name, keywords, required).
+- excludeKeywords: list of categories or objects the user explicitly wants to exclude (e.g. ["people", "cars", "houses"]).
+CRITICAL: Do not include generic filming terms (drone, aerial, landscape) as exclusions unless specifically forbidden.`;
 
   const base: PromptAnalysis = {
     dateStart: null, dateEnd: null, locationNames: [],
@@ -269,7 +287,16 @@ Rules:
         .filter((loc: string) => promptLower.includes(loc.toLowerCase()));
       base.includeTravel = parsed.includeTravel ?? false;
       base.style = parsed.style ?? "cinematic";
-      base.excludeKeywords = Array.isArray(parsed.excludeKeywords) ? parsed.excludeKeywords : [];
+      
+      const rawExcludes = Array.isArray(parsed.excludeKeywords) ? parsed.excludeKeywords : [];
+      
+      const expandedExcludes = new Set<string>();
+      for (const raw of rawExcludes) {
+        const k = typeof raw === "string" ? raw.toLowerCase().trim() : "";
+        if (k) expandedExcludes.add(k);
+      }
+      base.excludeKeywords = [...expandedExcludes];
+
       // Парсим темы
       if (Array.isArray(parsed.topics)) {
         base.topics = parsed.topics
@@ -294,7 +321,7 @@ Rules:
       batches.push(availableTags.slice(i, i + TAG_BATCH_SIZE));
     console.log(`  Classifying ${availableTags.length} library tags in ${batches.length} batch(es) by ${base.topics.length} topics...`);
     for (let i = 0; i < batches.length; i++) {
-      const r = await classifyTagBatch(prompt, base.topics, batches[i]!, i, batches.length);
+      const r = await classifyTagBatch(base.topics, base.excludeKeywords, batches[i]!, i, batches.length);
       // Добавляем теги к соответствующим темам
       for (const topic of base.topics) {
         const newTags = r.topicTags[topic.name] ?? [];
@@ -636,10 +663,18 @@ async function buildLLMInstructions(
   const requiredPool = allPool.filter(isRequired);
   const generalPool = allPool.filter((v) => !isRequired(v));
 
-  const maxRequired = Math.max(3, Math.ceil(50 * 0.25)); // макс 25% = 12-13 клипов
-  const reqSlice = requiredPool.slice(0, maxRequired);
-  const generalSlice = generalPool.slice(0, 50 - reqSlice.length);
-  const scored = shuffle([...reqSlice, ...generalSlice]);
+  // Берем до 50 клипов для LLM. Если есть обязательные — отдаем им приоритет,
+  // но не душим выборку, если их много.
+  let scored: VideoInfo[];
+  if (generalPool.length === 0) {
+    // Если всё в пуле - обязательное (как природа!), берем просто первые 50
+    scored = requiredPool.slice(0, 50);
+  } else {
+    // Если есть и обязательные (напр. машина) и общие (природа), балансируем 50/50
+    const reqCount = Math.min(requiredPool.length, 25);
+    const genCount = 50 - reqCount;
+    scored = shuffle([...requiredPool.slice(0, reqCount), ...generalPool.slice(0, genCount)]);
+  }
   const clipLines = scored.map((v) => {
     const zoneCount = v.bestSegments?.length || v.validZones.length;
     const shortName = path.basename(v.filePath).replace(/^DJI_\d+_(\d+)_D\.MP4$/i, "DJI_$1").slice(0, 16);
@@ -917,9 +952,35 @@ export async function createDirectorPlan(
     ((v.tags?.join(" ") ?? "") + " " + (v.description ?? "")).toLowerCase();
 
   // Жёсткое исключение по excludeKeywords
+  const excludedClips: Array<{ id: string; reason: string }> = [];
+  
   const afterExclude = withZones.filter((v) => {
     if (analysis.excludeKeywords.length === 0) return true;
-    return !analysis.excludeKeywords.some((k) => textOf(v).includes(k.toLowerCase()));
+    
+    const tags = (v.tags ?? []).map(t => t.toLowerCase());
+    const desc = (v.description ?? "").toLowerCase();
+    
+    // Очищаем список исключений
+    const cleanExclude = [...new Set(analysis.excludeKeywords
+      .map(k => k.toLowerCase().trim())
+      .filter(k => k.length > 1))];
+
+    if (cleanExclude.length === 0) return true;
+
+    // Сначала проверяем точное совпадение с тегами
+    for (const k of cleanExclude) {
+      if (tags.includes(k)) {
+        excludedClips.push({ id: v.id, reason: `tag:${k}` });
+        return false;
+      }
+      // Проверка по описанию — только целыми словами
+      const rx = new RegExp(`\\b${k}\\b`, "i");
+      if (rx.test(desc)) {
+        excludedClips.push({ id: v.id, reason: `desc:${k}` });
+        return false;
+      }
+    }
+    return true;
   });
 
   // Жёсткий фильтр по priorityKeywords — всегда, если они есть.
@@ -941,13 +1002,25 @@ export async function createDirectorPlan(
   })();
 
   // Если фильтры убили слишком много — откатываемся (не ломаем монтаж)
-  const MIN_VIDEOS = 5;
-  const preEffective =
-    afterInclude.length >= MIN_VIDEOS
-      ? afterInclude
-      : afterExclude.length >= MIN_VIDEOS
-        ? afterExclude
-        : withZones;
+  // Но черный список (exclude) стараемся держать до последнего.
+  const MIN_VIDEOS = 2; 
+  let preEffective = afterInclude;
+  let fallbackReason = "";
+
+  if (afterInclude.length < MIN_VIDEOS) {
+    if (afterExclude.length >= MIN_VIDEOS) {
+      preEffective = afterExclude;
+      fallbackReason = ` (not enough topics: found ${afterInclude.length}, using all non-excluded)`;
+    } else if (afterExclude.length > 0) {
+      preEffective = afterExclude;
+      fallbackReason = ` (critically low pool: only ${afterExclude.length} non-excluded clips left)`;
+    } else {
+      // Даже если 0 — мы НЕ берем withZones. Мы берем afterExclude (который пустой).
+      // Это приведет к ошибке "Пустой план монтажа", что ПРАВИЛЬНО.
+      preEffective = afterExclude;
+      fallbackReason = " (ALL clips excluded by filters!)";
+    }
+  }
 
   const effective = preEffective;
 
@@ -963,10 +1036,16 @@ export async function createDirectorPlan(
   console.log(
     `Director: ${effective.length}/${videos.length} clips selected` +
     topicSummary +
-    (analysis.excludeKeywords.length > 0 ? ` [exclude: ${analysis.excludeKeywords.length} (${analysis.excludeKeywords.slice(0, 4).join(", ")}...)]` : "") +
+    (analysis.excludeKeywords.length > 0 ? ` [exclude: ${analysis.excludeKeywords.length} tags, ${excludedClips.length} clips removed]` : "") +
+    fallbackReason +
     (analysis.requiredElements.length > 0 ? ` [required: ${reqMatchCount} clips match]` : "") +
     (analysis.locationNames.length > 0 ? ` [location: ${analysis.locationNames.join(", ")}]` : "")
   );
+
+  if (excludedClips.length > 0) {
+    const reasons = [...new Set(excludedClips.map((c) => c.reason))].slice(0, 15);
+    console.log(`  Exclusion examples: ${reasons.join(", ")}${reasons.length > 15 ? "..." : ""}`);
+  }
 
   // Определяем диапазон поездки по on-location видео (для GPS-безопасного скоринга)
   let tripRange: TripDateRange | null = null;
